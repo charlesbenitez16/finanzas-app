@@ -1,0 +1,372 @@
+================================================================================
+GUÍA DE SOLUCIÓN — MÓDULO alertas
+================================================================================
+Entidad ALERTAS_PAGO / tabla `alertas_pago`. Recordatorios de vencimiento
+de servicios fijos, con máquina de estados
+  Pendiente -> Enviada -> Leida -> Resuelta
+Dos piezas especiales:
+  - GenerarAlertasDeVencimientoUseCase: el job/cron (traduce la query
+    comentada al final de schema_finanzas.sql).
+  - ResolverAlertaAlPagarUseCase: HANDLER del evento GastoRegistrado que
+    publica el módulo gastos (relación `GASTOS |o--o| ALERTAS_PAGO` del .mermaid).
+
+Requisito de infra: shared/domain/events.py::EventBus implementado
+(ver CONFIGURACION_FUNCIONAL.txt sección 6.2).
+
+
+--------------------------------------------------------------------------------
+1. domain/entities.py  ->  AlertaPago  (máquina de estados)
+--------------------------------------------------------------------------------
+    _TRANSICIONES = {
+        "Pendiente": {"Enviada"},
+        "Enviada": {"Leida"},
+        "Leida": set(),
+        "Resuelta": set(),
+    }
+
+    def esta_pendiente(self) -> bool:
+        return self.estado == "Pendiente"
+
+    def esta_resuelta(self) -> bool:
+        return self.estado == "Resuelta"
+
+    def _transicionar(self, nuevo: str) -> None:
+        if nuevo not in _TRANSICIONES.get(self.estado, set()):
+            raise TransicionEstadoInvalida(
+                f"No se puede pasar de {self.estado} a {nuevo}")
+        self.estado = nuevo
+
+    def marcar_enviada(self) -> None:
+        self._transicionar("Enviada")
+
+    def marcar_leida(self) -> None:
+        self._transicionar("Leida")
+
+    def resolver(self, gasto_id: int) -> None:
+        if self.esta_resuelta():
+            return                       # idempotente: el evento puede llegar 2 veces
+        self.gasto_id = gasto_id
+        self.estado = "Resuelta"
+
+    def es_estado_valido(self) -> bool:
+        return self.estado in ESTADOS_ALERTA
+
+POR QUÉ:
+- Tabla de transiciones = el grafo legal en UN solo lugar. marcar_enviada
+  / marcar_leida solo la consultan. Transición ilegal -> excepción de
+  dominio.
+- resolver() es especial: puede dispararse desde CUALQUIER estado no
+  resuelto (pagar siempre resuelve, no importa si la alerta estaba
+  Pendiente o Leida) y es idempotente (si el bus entrega el evento dos
+  veces, la segunda no hace nada). Por eso NO pasa por _transicionar().
+- es_estado_valido() replica el CHECK
+  (estado IN ('Pendiente','Enviada','Leida','Resuelta')).
+- La entidad SÍ es dueña de su máquina de estados: solo mira self.estado,
+  no necesita nada externo (a diferencia de NivelPrioridad en catalogos).
+
+
+--------------------------------------------------------------------------------
+2. domain/ports/repositories.py
+--------------------------------------------------------------------------------
+Interfaz ABC completa. Cada método con su SQL. Clave:
+- listar_por_usuario_y_estado -> usa idx_alertas_usuario_estado
+- existe_alerta_para_servicio_en_periodo / obtener_por_servicio_y_periodo
+  -> misma clave que uq_alerta_servicio_periodo (uno devuelve bool, el
+  otro la fila).
+
+
+--------------------------------------------------------------------------------
+3. infrastructure/repositories.py  ->  DjangoAlertaPagoRepository
+--------------------------------------------------------------------------------
+    from typing import Optional
+
+    def _a_entidad(self, m):
+        return AlertaPago(
+            id=m.id, usuario_id=m.usuario_id, servicio_fijo_id=m.servicio_fijo_id,
+            gasto_id=m.gasto_id, periodo_mes=m.periodo_mes, periodo_anio=m.periodo_anio,
+            fecha_alerta=m.fecha_alerta, estado=m.estado, mensaje=m.mensaje,
+            fecha_creacion=m.fecha_creacion,
+        )
+
+    def obtener_por_id(self, alerta_id):
+        try:
+            return self._a_entidad(AlertaPagoModel.objects.get(id=alerta_id))
+        except AlertaPagoModel.DoesNotExist:
+            return None
+
+    def crear(self, alerta):
+        m = AlertaPagoModel.objects.create(
+            usuario_id=alerta.usuario_id, servicio_fijo_id=alerta.servicio_fijo_id,
+            gasto_id=alerta.gasto_id, periodo_mes=alerta.periodo_mes,
+            periodo_anio=alerta.periodo_anio, fecha_alerta=alerta.fecha_alerta,
+            estado=alerta.estado, mensaje=alerta.mensaje,
+        )
+        return self._a_entidad(m)
+
+    def actualizar(self, alerta):
+        AlertaPagoModel.objects.filter(id=alerta.id).update(
+            gasto_id=alerta.gasto_id, estado=alerta.estado, mensaje=alerta.mensaje,
+        )
+        return alerta
+
+    def listar_por_usuario_y_estado(self, usuario_id, estado):
+        qs = AlertaPagoModel.objects.filter(
+            usuario_id=usuario_id, estado=estado,
+        ).order_by("fecha_alerta")
+        return [self._a_entidad(m) for m in qs]
+
+    def existe_alerta_para_servicio_en_periodo(self, servicio_fijo_id, periodo_mes, periodo_anio):
+        return AlertaPagoModel.objects.filter(
+            servicio_fijo_id=servicio_fijo_id, periodo_mes=periodo_mes,
+            periodo_anio=periodo_anio,
+        ).exists()
+
+    def obtener_por_servicio_y_periodo(self, servicio_fijo_id, periodo_mes, periodo_anio):
+        m = AlertaPagoModel.objects.filter(
+            servicio_fijo_id=servicio_fijo_id, periodo_mes=periodo_mes,
+            periodo_anio=periodo_anio,
+        ).first()
+        return self._a_entidad(m) if m else None
+
+
+--------------------------------------------------------------------------------
+4. application/use_cases/
+--------------------------------------------------------------------------------
+4.1 generar_alertas_de_vencimiento.py   (el cron — vista E completa)
+
+    from datetime import date
+
+    def ejecutar(self, fecha_referencia=None):
+        fecha_referencia = fecha_referencia or date.today()
+        servicios = self.servicio_fijo_repositorio.listar_proximos_a_vencer(fecha_referencia)
+        creadas = []
+        for s in servicios:
+            venc = s.fecha_vencimiento_en(fecha_referencia.year, fecha_referencia.month)
+            mes, anio = venc.month, venc.year
+            if self.alerta_repositorio.existe_alerta_para_servicio_en_periodo(s.id, mes, anio):
+                continue
+            alerta = AlertaPago(
+                usuario_id=s.usuario_id, servicio_fijo_id=s.id, gasto_id=None,
+                periodo_mes=mes, periodo_anio=anio, fecha_alerta=fecha_referencia,
+                estado="Pendiente",
+                mensaje=f"Tu servicio '{s.nombre}' vence el {venc.isoformat()}.",
+            )
+            creadas.append(self.alerta_repositorio.crear(alerta))
+        return creadas
+
+  POR QUÉ:
+  - listar_proximos_a_vencer YA aplicó "activo" + ventana de anticipación
+    (usa ServicioFijo.debe_generar_alerta). Acá solo agregamos la
+    IDEMPOTENCIA: `existe_alerta_para_servicio_en_periodo` cubre
+    uq_alerta_servicio_periodo, así correr el cron dos veces el mismo día
+    no duplica.
+  - El "AND NOT EXISTS (pago del mes)" de la query SQL: un servicio ya
+    pagado sigue estando `activo = TRUE`, así que podría aparecer. Para
+    fidelidad total, inyectá también GastoRepository y agregá:
+        if self.gasto_repositorio.existe_pago_de_servicio_en_periodo(s.id, mes, anio):
+            continue
+    (agregá el campo `gasto_repositorio` al dataclass del caso de uso.)
+  - Devuelve solo las alertas NUEVAS (para que la vista/cron reporte
+    "se generaron N").
+
+4.2 listar_alertas_pendientes.py
+    def ejecutar(self, usuario_id, estado="Pendiente"):
+        return self.repositorio.listar_por_usuario_y_estado(usuario_id, estado)
+
+4.3 marcar_alerta.py   (ambos casos de uso)
+
+    def ejecutar(self, alerta_id):           # MarcarAlertaComoEnviadaUseCase
+        alerta = self.repositorio.obtener_por_id(alerta_id)
+        if alerta is None:
+            raise AlertaNoEncontrada(f"No existe la alerta {alerta_id}")
+        alerta.marcar_enviada()              # puede lanzar TransicionEstadoInvalida
+        return self.repositorio.actualizar(alerta)
+
+    # MarcarAlertaComoLeidaUseCase: idéntico pero alerta.marcar_leida()
+
+4.4 resolver_alerta_al_pagar.py   (HANDLER del evento)
+
+    import logging
+    logger = logging.getLogger(__name__)
+
+    def manejar(self, evento):
+        if evento.servicio_fijo_id is None:
+            return                                   # gasto puntual: no hay alerta
+        try:
+            alerta = self.repositorio.obtener_por_servicio_y_periodo(
+                evento.servicio_fijo_id, evento.periodo_mes, evento.periodo_anio)
+            if alerta is None or alerta.esta_resuelta():
+                return
+            alerta.resolver(evento.gasto_id)
+            self.repositorio.actualizar(alerta)
+        except Exception:                            # noqa: BLE001
+            logger.exception("No se pudo resolver la alerta para el evento %r", evento)
+
+  POR QUÉ tragar la excepción: este handler corre SÍNCRONO dentro de
+  RegistrarPagoDeServicioFijoUseCase (via event_bus.publicar). Si el
+  update de la alerta falla, NO debe voltear ni romper el registro del
+  pago. Se loguea y sigue. (En un bus async con reintentos, dejarías
+  propagar.)
+
+
+--------------------------------------------------------------------------------
+5. apps.py  ->  ready()   (wiring del evento)
+--------------------------------------------------------------------------------
+    def ready(self) -> None:
+        from shared.domain.events import event_bus
+        from modules.gastos.domain.events import GastoRegistrado
+        from modules.alertas.application.use_cases.resolver_alerta_al_pagar import (
+            ResolverAlertaAlPagarUseCase,
+        )
+        from modules.alertas.infrastructure.repositories import DjangoAlertaPagoRepository
+
+        caso = ResolverAlertaAlPagarUseCase(repositorio=DjangoAlertaPagoRepository())
+        event_bus.suscribir(GastoRegistrado, caso.manejar)
+
+POR QUÉ:
+- ready() corre UNA vez, después de que el registro de apps está armado.
+- Imports DIFERIDOS (dentro de la función): importar repos/modelos en el
+  top de apps.py explota porque los modelos todavía no están listos.
+- A partir de acá, cada RegistrarPagoDeServicioFijoUseCase que publique
+  GastoRegistrado va a disparar caso.manejar(evento) en la misma llamada.
+- Si NO implementás esto, el sistema igual funciona: gastos publica a un
+  bus sin suscriptores = no-op. Las alertas simplemente no se resuelven
+  solas al pagar (podrías resolverlas a mano por el PATCH... aunque el
+  PATCH no expone 'Resuelta' a propósito; ver serializers).
+
+
+--------------------------------------------------------------------------------
+6. interfaces/api/  (views)
+--------------------------------------------------------------------------------
+    from datetime import date
+    from modules.servicios_fijos.infrastructure.repositories import DjangoServicioFijoRepository
+
+    class AlertasView(APIView):
+        def get(self, request):
+            estado = request.query_params.get("estado", "Pendiente")
+            caso = ListarAlertasPendientesUseCase(repositorio=DjangoAlertaPagoRepository())
+            return Response(AlertaPagoSerializer(
+                caso.ejecutar(request.user.id, estado), many=True).data)
+
+    class GenerarAlertasView(APIView):
+        def post(self, request):
+            fecha_str = request.data.get("fecha") or request.query_params.get("fecha")
+            fecha = date.fromisoformat(fecha_str) if fecha_str else None
+            caso = GenerarAlertasDeVencimientoUseCase(
+                servicio_fijo_repositorio=DjangoServicioFijoRepository(),
+                alerta_repositorio=DjangoAlertaPagoRepository(),
+            )
+            creadas = caso.ejecutar(fecha)
+            return Response(AlertaPagoSerializer(creadas, many=True).data,
+                            status=status.HTTP_201_CREATED)
+
+    class AlertaDetailView(APIView):
+        def patch(self, request, alerta_id):
+            e = CambiarEstadoAlertaSerializer(data=request.data)
+            e.is_valid(raise_exception=True)
+            repo = DjangoAlertaPagoRepository()
+            destino = e.validated_data["estado"]
+            caso = (MarcarAlertaComoEnviadaUseCase(repositorio=repo)
+                    if destino == "Enviada"
+                    else MarcarAlertaComoLeidaUseCase(repositorio=repo))
+            try:
+                alerta = caso.ejecutar(alerta_id)
+            except AlertaNoEncontrada as ex:
+                return Response({"detail": str(ex)}, status=status.HTTP_404_NOT_FOUND)
+            except TransicionEstadoInvalida as ex:
+                return Response({"detail": str(ex)}, status=status.HTTP_409_CONFLICT)
+            return Response(AlertaPagoSerializer(alerta).data)
+
+POR QUÉ el PATCH no acepta 'Resuelta': una alerta se resuelve SOLA cuando
+se registra el pago (evento GastoRegistrado -> handler). Exponerlo por API
+abriría un camino para marcar "resuelta" sin que haya un gasto asociado.
+
+
+--------------------------------------------------------------------------------
+7. tests
+--------------------------------------------------------------------------------
+Doble en memoria:
+
+    from dataclasses import replace
+
+    def obtener_por_id(self, alerta_id):
+        return next((a for a in self._alertas if a.id == alerta_id), None)
+
+    def crear(self, alerta):
+        creada = replace(alerta, id=self._siguiente_id)
+        self._alertas.append(creada); self._siguiente_id += 1
+        return creada
+
+    def actualizar(self, alerta):
+        self._alertas = [alerta if a.id == alerta.id else a for a in self._alertas]
+        return alerta
+
+    def listar_por_usuario_y_estado(self, usuario_id, estado):
+        return [a for a in self._alertas if a.usuario_id == usuario_id and a.estado == estado]
+
+    def existe_alerta_para_servicio_en_periodo(self, servicio_fijo_id, periodo_mes, periodo_anio):
+        return any(a.servicio_fijo_id == servicio_fijo_id
+                   and a.periodo_mes == periodo_mes and a.periodo_anio == periodo_anio
+                   for a in self._alertas)
+
+    def obtener_por_servicio_y_periodo(self, servicio_fijo_id, periodo_mes, periodo_anio):
+        return next((a for a in self._alertas
+                     if a.servicio_fijo_id == servicio_fijo_id
+                     and a.periodo_mes == periodo_mes and a.periodo_anio == periodo_anio), None)
+
+Tests de entidad (máquina de estados):
+
+    def test_marcar_leida_sin_pasar_por_enviada_lanza(self):
+        with self.assertRaises(TransicionEstadoInvalida):
+            AlertaPago(estado="Pendiente").marcar_leida()
+
+    def test_resolver_setea_gasto_id_y_estado(self):
+        a = AlertaPago(estado="Enviada")
+        a.resolver(42)
+        self.assertEqual(a.gasto_id, 42)
+        self.assertTrue(a.esta_resuelta())
+
+    def test_resolver_es_idempotente(self):
+        a = AlertaPago(estado="Resuelta", gasto_id=1)
+        a.resolver(99)
+        self.assertEqual(a.gasto_id, 1)   # no lo pisa
+
+Test del handler:
+
+    def test_resuelve_la_alerta_del_servicio_y_periodo_del_evento(self):
+        repo = RepositorioAlertaPagoFalso([
+            AlertaPago(id=1, usuario_id=7, servicio_fijo_id=2, periodo_mes=3,
+                       periodo_anio=2026, estado="Enviada"),
+        ])
+        caso = ResolverAlertaAlPagarUseCase(repositorio=repo)
+        caso.manejar(GastoRegistrado(gasto_id=55, usuario_id=7, servicio_fijo_id=2,
+                                     periodo_mes=3, periodo_anio=2026))
+        self.assertTrue(repo.obtener_por_id(1).esta_resuelta())
+        self.assertEqual(repo.obtener_por_id(1).gasto_id, 55)
+
+    def test_evento_sin_servicio_fijo_id_no_hace_nada(self):
+        repo = RepositorioAlertaPagoFalso()
+        ResolverAlertaAlPagarUseCase(repositorio=repo).manejar(
+            GastoRegistrado(gasto_id=1, usuario_id=7, servicio_fijo_id=None,
+                            periodo_mes=3, periodo_anio=2026))
+        # no explota, no crea nada
+
+
+--------------------------------------------------------------------------------
+8. VERIFICACIÓN MANUAL
+--------------------------------------------------------------------------------
+    uv run python -m unittest modules.alertas.tests.domain.test_entities \
+        modules.alertas.tests.application.test_use_cases -v
+
+    # server + seed + EventBus + ready() implementados:
+    POST /api/alertas/generar/  {"fecha":"2026-03-07"}
+       -> crea alertas Pendiente para los servicios que vencen ~3 días después
+    GET  /api/alertas/?estado=Pendiente
+    PATCH /api/alertas/<id>/  {"estado":"Enviada"}   -> 200
+    PATCH /api/alertas/<id>/  {"estado":"Leida"} de nuevo sobre una Pendiente -> 409
+
+    # prueba del evento end-to-end:
+    POST /api/gastos/pagos-servicio/ para un servicio que tiene alerta Pendiente
+       -> el gasto se registra Y la alerta de ese servicio/periodo pasa a 'Resuelta'
+          con gasto_id seteado (lo hizo el handler, sin llamar a alertas).
+================================================================================

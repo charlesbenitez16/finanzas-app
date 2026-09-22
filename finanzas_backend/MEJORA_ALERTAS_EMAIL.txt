@@ -1,0 +1,409 @@
+================================================================================
+MEJORA — NOTIFICAR POR EMAIL LAS ALERTAS DE PAGO DE SERVICIOS FIJOS
+================================================================================
+Ningún archivo de código fue tocado. Esto es solo el plan + el diseño de
+referencia, tal como pediste. Primero los pasos a seguir; después, en una
+sección aparte, el detalle completo (diseño + código de referencia) de
+cómo lo implementaría.
+
+DATO CLAVE antes de empezar: el email del usuario para mandar el correo
+sale de `auth_user.email` (Django), NO de `usuarios.email` (la tabla de
+perfil). Recordá que `usuario_id` en TODA la app (alertas, gastos,
+servicios_fijos, etc.) es el id de `auth_user`, no el id de `usuarios`
+— es la misma decisión que ya quedó documentada cuando armamos el
+puente JWT. Buscar el email por el lado equivocado sería el primer bug
+típico de esta feature.
+
+
+================================================================================
+SECCIÓN 1 — PASOS A SEGUIR
+================================================================================
+[ ] 1. Confirmar el origen del email: auth_user.email (no usuarios.email).
+
+[ ] 2. Elegir el mecanismo de envío. Recomendado para arrancar: el
+       backend de email que ya trae Django (django.core.mail), sin
+       agregar ninguna dependencia nueva ni servicio externo (SendGrid/
+       Mailgun/SES quedan como upgrade posible el día que haga falta
+       volumen o métricas de entrega, no para esta primera versión).
+
+[ ] 3. Agregar la configuración de email a settings (EMAIL_BACKEND,
+       EMAIL_HOST, EMAIL_PORT, EMAIL_HOST_USER, EMAIL_HOST_PASSWORD,
+       EMAIL_USE_TLS, DEFAULT_FROM_EMAIL), todo leído de variables de
+       entorno con un default de "backend de consola" para dev (así se
+       prueba sin credenciales SMTP reales: el correo se imprime en los
+       logs del contenedor).
+
+[ ] 4. Definir el PUERTO de dominio: una interfaz NotificadorEmail en
+       modules/alertas/domain/ports/, con un solo método enviar(...).
+       Mismo patrón hexagonal que ya usás para los repositorios: el
+       dominio declara QUÉ necesita, no CÓMO se manda.
+
+[ ] 5. Implementar el ADAPTER: DjangoEmailNotificador en
+       modules/alertas/infrastructure/, usando django.core.mail.send_mail
+       para cumplir ese puerto.
+
+[ ] 6. Definir el EVENTO de dominio AlertaGenerada en
+       modules/alertas/domain/events.py — mismo patrón que ya existe
+       para GastoRegistrado (modules/gastos/domain/events.py).
+
+[ ] 7. Publicar ese evento desde GenerarAlertasDeVencimientoUseCase,
+       justo después de crear cada alerta nueva (mismo lugar/estilo que
+       ya publica GastoRegistrado RegistrarPagoDeServicioFijoUseCase).
+
+[ ] 8. Crear el caso de uso EnviarNotificacionAlertaUseCase: es el
+       SUSCRIPTOR de AlertaGenerada (mismo rol que ya cumple
+       ResolverAlertaAlPagarUseCase para GastoRegistrado). Busca el
+       email por auth_user, arma el mensaje, llama al puerto
+       NotificadorEmail, y SOLO SI el envío no lanzó excepción marca la
+       alerta como "Enviada" (reusa AlertaPago.marcar_enviada(), que ya
+       existe). Si falla, loguea y deja la alerta en "Pendiente".
+
+[ ] 9. Suscribir ese nuevo handler al evento en
+       modules/alertas/apps.py::ready(), al lado de la suscripción que
+       ya existe para GastoRegistrado -> ResolverAlertaAlPagarUseCase.
+
+[ ] 10. Redactar el contenido del correo: para arrancar alcanza con
+        reusar AlertaPago.mensaje (ya trae "Tu servicio 'X' vence el
+        AAAA-MM-DD."); como mejora posterior, armar un texto más
+        completo (monto estimado, días restantes, link al front).
+
+[ ] 11. Probar en desarrollo con el backend de consola: correr
+        POST /api/alertas/generar/ y mirar los logs del contenedor
+        (docker compose logs backend) — el "correo" va a aparecer
+        impreso ahí, sin necesitar SMTP real.
+
+[ ] 12. Tests:
+        - application: un NotificadorEmailFalso (doble en memoria, mismo
+          estilo que los RepositorioXFalso que ya tenés en cada módulo)
+          para probar EnviarNotificacionAlertaUseCase sin mandar mail de
+          verdad.
+        - infrastructure: un test con manage.py test usando el backend
+          "locmem" de Django (settings de test), revisando
+          django.core.mail.outbox para confirmar que se llamó a
+          send_mail con el destinatario/asunto/cuerpo correctos.
+
+[ ] 13. (Opcional, a futuro) Definir qué pasa si el envío falla: hoy la
+        alerta queda "Pendiente" pero generar_alertas_de_vencimiento no
+        la va a recrear (ya existe para ese servicio/periodo) ni nada la
+        reintenta sola. Si esto importa, evaluar un endpoint o un job
+        que reintente el envío de alertas "Pendiente" con cierta
+        antigüedad.
+
+[ ] 14. Recién en producción: configurar las credenciales SMTP reales
+        (variables de entorno EMAIL_HOST/EMAIL_HOST_USER/
+        EMAIL_HOST_PASSWORD, etc.) — nada de esto se toca en el código
+        de dev.
+
+
+================================================================================
+SECCIÓN 2 — LA RESPUESTA: DISEÑO DETALLADO + CÓDIGO DE REFERENCIA
+================================================================================
+Nada de lo siguiente está aplicado al repo. Es la guía completa para que
+lo implementes vos (o me pidas que lo aplique después).
+
+--------------------------------------------------------------------------------
+2.1 — config/settings/base.py (agregar, no reemplazar nada existente)
+--------------------------------------------------------------------------------
+    # Email: por defecto imprime en consola (dev). En produccion,
+    # sobreescribir EMAIL_BACKEND a smtp y completar credenciales por
+    # variable de entorno, igual que ya se hace con POSTGRES_*.
+    EMAIL_BACKEND = os.environ.get(
+        "EMAIL_BACKEND", "django.core.mail.backends.console.EmailBackend"
+    )
+    EMAIL_HOST = os.environ.get("EMAIL_HOST", "")
+    EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "587"))
+    EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "")
+    EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "")
+    EMAIL_USE_TLS = os.environ.get("EMAIL_USE_TLS", "True") == "True"
+    DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "no-reply@finanzas.local")
+
+POR QUÉ backend de consola por defecto: mismo espíritu que las demás
+settings del proyecto (SECRET_KEY, POSTGRES_*): funciona out-of-the-box
+en dev sin credenciales reales, y en docker-compose.yml alcanza con
+agregar las variables de entorno del backend service para pasar a SMTP
+real cuando haga falta probarlo de punta a punta.
+
+
+--------------------------------------------------------------------------------
+2.2 — modules/alertas/domain/ports/notificaciones.py (archivo NUEVO)
+--------------------------------------------------------------------------------
+    """
+    Puerto para notificar al usuario por un canal externo a la API. Hoy
+    solo email, pero la interfaz queda abierta a otros canales (push,
+    SMS) sin que el dominio sepa cual se usa en cada caso.
+    """
+
+    from abc import ABC, abstractmethod
+
+
+    class NotificadorEmail(ABC):
+        @abstractmethod
+        def enviar(self, destinatario: str, asunto: str, cuerpo: str) -> None:
+            """
+            Envia un email. Si el envio falla, DEBE dejar propagar la
+            excepcion (no la traga acá): la politica de "loguear y
+            seguir" vive en el caso de uso que orquesta (mismo criterio
+            que ya usa ResolverAlertaAlPagarUseCase), no en el adapter.
+            """
+            ...
+
+POR QUÉ un puerto nuevo y no meterlo en AlertaPagoRepository: no es
+persistencia, es un efecto de lado distinto (un servicio externo). Igual
+que catalogos separa dominio/aplicacion/infraestructura, esto separa
+"guardar datos" de "notificar afuera".
+
+
+--------------------------------------------------------------------------------
+2.3 — modules/alertas/infrastructure/notificaciones.py (archivo NUEVO)
+--------------------------------------------------------------------------------
+    """
+    Implementacion de NotificadorEmail usando el sistema de envio de
+    Django (django.core.mail), configurado por EMAIL_BACKEND en
+    settings (consola en dev, SMTP real en produccion).
+    """
+
+    from django.conf import settings
+    from django.core.mail import send_mail
+
+    from modules.alertas.domain.ports.notificaciones import NotificadorEmail
+
+
+    class DjangoEmailNotificador(NotificadorEmail):
+        def enviar(self, destinatario: str, asunto: str, cuerpo: str) -> None:
+            send_mail(
+                subject=asunto,
+                message=cuerpo,
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[destinatario],
+                fail_silently=False,
+            )
+
+
+--------------------------------------------------------------------------------
+2.4 — modules/alertas/domain/events.py (archivo NUEVO)
+--------------------------------------------------------------------------------
+    """Eventos de dominio que publica el modulo alertas."""
+
+    from dataclasses import dataclass
+
+    from shared.domain.events import DomainEvent
+
+
+    @dataclass(frozen=True)
+    class AlertaGenerada(DomainEvent):
+        """
+        Se publica cuando GenerarAlertasDeVencimientoUseCase crea una
+        alerta nueva. El propio modulo alertas se suscribe (ver
+        apps.py::ready) para disparar el email -- separa "generar la
+        alerta" de "avisar por mail", mismo patron que GastoRegistrado /
+        ResolverAlertaAlPagarUseCase ya usan en este proyecto.
+        """
+
+        alerta_id: int = 0
+        usuario_id: int = 0
+        servicio_fijo_id: int = 0
+        mensaje: str = ""
+
+
+--------------------------------------------------------------------------------
+2.5 — modules/alertas/application/use_cases/generar_alertas_de_vencimiento.py
+      (MODIFICAR: publicar el evento después de crear cada alerta)
+--------------------------------------------------------------------------------
+    from shared.domain.events import event_bus
+    from modules.alertas.domain.events import AlertaGenerada
+    # (el resto de los imports que ya tiene el archivo, sin cambios)
+
+    def ejecutar(self, fecha_referencia: date | None = None) -> list[AlertaPago]:
+        fecha_referencia = fecha_referencia or date.today()
+        servicios = self.servicio_fijo_repositorio.listar_proximos_a_vencer(fecha_referencia)
+        creadas = []
+        for s in servicios:
+            venc = s.fecha_vencimiento_en(fecha_referencia.month, fecha_referencia.year)
+            mes, anio = venc.month, venc.year
+            if self.alerta_repositorio.existe_alerta_para_servicio_en_periodo(s.id, mes, anio):
+                continue
+            alerta = AlertaPago(
+                usuario_id=s.usuario_id, servicio_fijo_id=s.id, gasto_id=None,
+                periodo_mes=mes, periodo_anio=anio, fecha_alerta=fecha_referencia,
+                estado="Pendiente",
+                mensaje=f"Tu servicio '{s.nombre}' vence el {venc.isoformat()}.",
+            )
+            alerta_creada = self.alerta_repositorio.crear(alerta)
+            event_bus.publicar(AlertaGenerada(
+                alerta_id=alerta_creada.id,
+                usuario_id=alerta_creada.usuario_id,
+                servicio_fijo_id=alerta_creada.servicio_fijo_id,
+                mensaje=alerta_creada.mensaje,
+            ))
+            creadas.append(alerta_creada)
+        return creadas
+
+ÚNICO cambio real acá: guardar el resultado de crear() en una variable
+(alerta_creada) para poder usar su .id ya asignado al armar el evento, y
+publicar el evento antes de appendearla a creadas.
+
+
+--------------------------------------------------------------------------------
+2.6 — modules/alertas/application/use_cases/enviar_notificacion_alerta.py
+      (archivo NUEVO — el handler/suscriptor)
+--------------------------------------------------------------------------------
+    """Caso de uso / handler: enviar el email de una alerta recien generada."""
+
+    import logging
+    from dataclasses import dataclass
+
+    from django.contrib.auth import get_user_model
+
+    from modules.alertas.domain.events import AlertaGenerada
+    from modules.alertas.domain.ports.notificaciones import NotificadorEmail
+    from modules.alertas.domain.ports.repositories import AlertaPagoRepository
+
+    logger = logging.getLogger(__name__)
+    AuthUser = get_user_model()
+
+
+    @dataclass
+    class EnviarNotificacionAlertaUseCase:
+        """
+        Suscriptor de AlertaGenerada (se registra en alertas/apps.py::ready).
+        Busca el email en auth_user (NO en usuarios: usuario_id es el id
+        de auth_user en toda la app), arma el mensaje, lo manda por el
+        puerto NotificadorEmail y, si salio bien, marca la alerta como
+        'Enviada'. Si algo falla (el mail no salio, el usuario no tiene
+        email, lo que sea), solo loguea: un email que falla NO debe
+        tumbar el resto del job de generar alertas ni el request que lo
+        disparo (mismo criterio que ResolverAlertaAlPagarUseCase).
+        """
+
+        repositorio: AlertaPagoRepository
+        notificador: NotificadorEmail
+
+        def manejar(self, evento: AlertaGenerada) -> None:
+            try:
+                alerta = self.repositorio.obtener_por_id(evento.alerta_id)
+                if alerta is None or not alerta.esta_pendiente():
+                    return
+                auth_user = AuthUser.objects.filter(id=evento.usuario_id).first()
+                if auth_user is None or not auth_user.email:
+                    logger.warning(
+                        "Usuario %s sin email valido, no se envia la alerta %s",
+                        evento.usuario_id, evento.alerta_id,
+                    )
+                    return
+                self.notificador.enviar(
+                    destinatario=auth_user.email,
+                    asunto="Recordatorio de pago - Finanzas",
+                    cuerpo=evento.mensaje,
+                )
+                alerta.marcar_enviada()
+                self.repositorio.actualizar(alerta)
+            except Exception:
+                logger.exception(
+                    "No se pudo enviar el email de la alerta %s", evento.alerta_id
+                )
+
+NOTA sobre "esta_pendiente()": es una guarda de idempotencia -- si por lo
+que sea el evento se procesara dos veces, no se manda el mail ni se
+reintenta la transicion de estado sobre una alerta que ya dejo de estar
+Pendiente.
+
+
+--------------------------------------------------------------------------------
+2.7 — modules/alertas/apps.py (MODIFICAR: agregar la segunda suscripción)
+--------------------------------------------------------------------------------
+    def ready(self) -> None:
+        from shared.domain.events import event_bus
+        from modules.gastos.domain.events import GastoRegistrado
+        from modules.alertas.domain.events import AlertaGenerada
+        from modules.alertas.application.use_cases.resolver_alerta_al_pagar import (
+            ResolverAlertaAlPagarUseCase,
+        )
+        from modules.alertas.application.use_cases.enviar_notificacion_alerta import (
+            EnviarNotificacionAlertaUseCase,
+        )
+        from modules.alertas.infrastructure.repositories import DjangoAlertaPagoRepository
+        from modules.alertas.infrastructure.notificaciones import DjangoEmailNotificador
+
+        repo = DjangoAlertaPagoRepository()
+
+        caso_resolver = ResolverAlertaAlPagarUseCase(repositorio=repo)
+        event_bus.suscribir(GastoRegistrado, caso_resolver.manejar)
+
+        caso_notificar = EnviarNotificacionAlertaUseCase(
+            repositorio=repo, notificador=DjangoEmailNotificador(),
+        )
+        event_bus.suscribir(AlertaGenerada, caso_notificar.manejar)
+
+Recordatorio (ya documentado en el propio archivo): estos imports van
+DENTRO de ready(), nunca al nivel de modulo del archivo apps.py, porque
+Django todavia no tiene el registro de apps listo cuando importa
+apps.py -- ver el gotcha ya resuelto anteriormente en este mismo módulo.
+
+
+--------------------------------------------------------------------------------
+2.8 — docker-compose.yml (backend service) — variables opcionales
+--------------------------------------------------------------------------------
+Para dev no hace falta tocar nada (EMAIL_BACKEND por defecto ya es el de
+consola). Para probar contra un SMTP real desde el contenedor, agregar
+al bloque `environment:` del servicio backend:
+
+    EMAIL_BACKEND: django.core.mail.backends.smtp.EmailBackend
+    EMAIL_HOST: smtp.tu-proveedor.com
+    EMAIL_PORT: "587"
+    EMAIL_HOST_USER: tu-usuario@tu-proveedor.com
+    EMAIL_HOST_PASSWORD: tu-password-o-app-password
+    EMAIL_USE_TLS: "True"
+    DEFAULT_FROM_EMAIL: no-reply@tu-dominio.com
+
+
+--------------------------------------------------------------------------------
+2.9 — Tests de referencia
+--------------------------------------------------------------------------------
+application (doble en memoria, sin Django ni SMTP real):
+
+    class NotificadorEmailFalso:
+        def __init__(self):
+            self.enviados = []  # lista de (destinatario, asunto, cuerpo)
+        def enviar(self, destinatario, asunto, cuerpo):
+            self.enviados.append((destinatario, asunto, cuerpo))
+
+    def test_envia_el_email_y_marca_la_alerta_enviada(self):
+        repo = RepositorioAlertaPagoFalso([
+            AlertaPago(id=1, usuario_id=7, servicio_fijo_id=3, estado="Pendiente",
+                       mensaje="Tu servicio 'Luz' vence el 2026-09-20."),
+        ])
+        notificador = NotificadorEmailFalso()
+        caso = EnviarNotificacionAlertaUseCase(repositorio=repo, notificador=notificador)
+        caso.manejar(AlertaGenerada(alerta_id=1, usuario_id=7, servicio_fijo_id=3,
+                                     mensaje="Tu servicio 'Luz' vence el 2026-09-20."))
+        self.assertEqual(len(notificador.enviados), 1)
+        self.assertTrue(repo.obtener_por_id(1).esta_pendiente() is False)  # ya no Pendiente
+
+infrastructure (con manage.py test, backend "locmem" -- Django ya lo usa
+automaticamente durante los tests sin que haya que configurar nada):
+
+    from django.core import mail
+
+    def test_send_mail_llega_al_outbox_de_test(self):
+        DjangoEmailNotificador().enviar("alguien@example.com", "Asunto", "Cuerpo")
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, ["alguien@example.com"])
+
+
+--------------------------------------------------------------------------------
+2.10 — Cómo probarlo manualmente una vez implementado
+--------------------------------------------------------------------------------
+    docker compose exec backend uv run manage.py shell -c "
+    from django.contrib.auth import get_user_model
+    U = get_user_model()
+    print(U.objects.filter(id=<tu_usuario_id>).values('email'))
+    "
+    # confirmar que ese usuario tiene email antes de probar
+
+    curl -u admin:tu_password -X POST http://localhost:8000/api/alertas/generar/ \
+      -H 'Content-Type: application/json' -d '{"fecha":"AAAA-MM-DD"}'
+
+    docker compose logs backend --tail=50
+    # con EMAIL_BACKEND de consola, el "correo" completo (para, asunto,
+    # cuerpo) aparece impreso ahí mismo, sin mandar nada de verdad.
+================================================================================

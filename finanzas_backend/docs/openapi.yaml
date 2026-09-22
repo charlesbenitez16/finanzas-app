@@ -1,0 +1,1404 @@
+openapi: 3.0.3
+info:
+  title: Finanzas API
+  version: 1.0.0
+  description: 'API del sistema de finanzas personales: usuarios, ingresos, servicios
+    fijos, gastos, planes financieros y alertas de pago.'
+paths:
+  /api/alertas/:
+    get:
+      operationId: alertas_list
+      description: Alertas del usuario autenticado en un estado dado (Pendiente/Enviada/Leida/Resuelta).
+      summary: Listar alertas por estado
+      parameters:
+      - in: query
+        name: estado
+        schema:
+          type: string
+        description: Pendiente (default) | Enviada | Leida | Resuelta.
+      tags:
+      - Alertas
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AlertaPago'
+          description: ''
+  /api/alertas/{alerta_id}/:
+    patch:
+      operationId: alertas_partial_update
+      description: 'Aplica una transición manual de estado: Pendiente -> Enviada,
+        o Enviada -> Leida. ''Resuelta'' no se setea por acá: ocurre sola cuando se
+        registra el pago del servicio fijo correspondiente.'
+      summary: Cambiar estado de una alerta
+      parameters:
+      - in: path
+        name: alerta_id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - Alertas
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchedCambiarEstadoAlerta'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PatchedCambiarEstadoAlerta'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PatchedCambiarEstadoAlerta'
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertaPago'
+          description: ''
+        '404':
+          description: No existe la alerta.
+        '409':
+          description: Transición de estado no permitida.
+  /api/alertas/generar/:
+    post:
+      operationId: alertas_generar_create
+      description: 'Crea alertas ''Pendiente'' para los servicios fijos próximos a
+        vencer (parado en `fecha`, por defecto hoy). Idempotente: no duplica alertas
+        ya generadas para el mismo servicio/periodo.'
+      summary: Generar alertas de vencimiento
+      parameters:
+      - in: query
+        name: fecha
+        schema:
+          type: string
+          format: date
+        description: Fecha de referencia (YYYY-MM-DD). También se acepta en el body.
+          Por defecto, hoy.
+      tags:
+      - Alertas
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AlertaPago'
+          description: ''
+  /api/catalogos/categorias/:
+    get:
+      operationId: catalogos_categorias_list
+      description: Categorías globales del sistema (usuario_id nulo) + las personalizadas
+        del usuario autenticado.
+      summary: Listar categorías de gasto
+      tags:
+      - Catálogos
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CategoriaGasto'
+          description: ''
+    post:
+      operationId: catalogos_categorias_create
+      description: Crea una categoría de gasto propia del usuario autenticado.
+      summary: Crear categoría personalizada
+      tags:
+      - Catálogos
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CategoriaGasto'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/CategoriaGasto'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/CategoriaGasto'
+        required: true
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CategoriaGasto'
+          description: ''
+        '400':
+          description: Ya existe una categoría con ese nombre para este usuario.
+  /api/catalogos/niveles-prioridad/:
+    get:
+      operationId: catalogos_niveles_prioridad_list
+      description: Catálogo fijo de solo lectura (Esencial, Importante, Prescindible),
+        ordenado por nivel_orden.
+      summary: Listar niveles de prioridad
+      tags:
+      - Catálogos
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/NivelPrioridad'
+          description: ''
+  /api/gastos/:
+    get:
+      operationId: gastos_list
+      description: Gastos del usuario autenticado en el periodo (mes, año) indicado
+        (puntuales y pagos de servicio fijo).
+      summary: Listar gastos del periodo
+      parameters:
+      - in: query
+        name: anio
+        schema:
+          type: integer
+        description: Año del periodo.
+        required: true
+      - in: query
+        name: mes
+        schema:
+          type: integer
+        description: Mes del periodo (1-12).
+        required: true
+      tags:
+      - Gastos
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Gasto'
+          description: ''
+    post:
+      operationId: gastos_create
+      description: Da de alta un gasto NO ligado a un servicio fijo (mercado, salidas,
+        compras varias).
+      summary: Registrar un gasto puntual
+      tags:
+      - Gastos
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Gasto'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/Gasto'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Gasto'
+        required: true
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Gasto'
+          description: ''
+        '400':
+          description: Monto o estado inválido.
+  /api/gastos/balance-mensual/:
+    get:
+      operationId: gastos_balance_mensual_retrieve
+      description: total_ingresos - total_gastos del usuario autenticado en el periodo
+        indicado.
+      summary: Balance mensual
+      parameters:
+      - in: query
+        name: anio
+        schema:
+          type: integer
+        description: Año del periodo.
+        required: true
+      - in: query
+        name: mes
+        schema:
+          type: integer
+        description: Mes del periodo (1-12).
+        required: true
+      tags:
+      - Gastos
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BalanceMensual'
+          description: ''
+  /api/gastos/modo-emergencia/:
+    get:
+      operationId: gastos_modo_emergencia_list
+      description: Gasto por prioridad del periodo y ahorro acumulado si se suspenden
+        los gastos más prescindibles.
+      summary: Simular modo emergencia
+      parameters:
+      - in: query
+        name: anio
+        schema:
+          type: integer
+        description: Año del periodo.
+        required: true
+      - in: query
+        name: mes
+        schema:
+          type: integer
+        description: Mes del periodo (1-12).
+        required: true
+      tags:
+      - Gastos
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AhorroEmergencia'
+          description: ''
+  /api/gastos/pagos-servicio/:
+    post:
+      operationId: gastos_pagos_servicio_create
+      description: Registra el pago de un servicio fijo para un periodo (categoría/prioridad
+        se deducen del propio servicio).
+      summary: Registrar pago de un servicio fijo
+      tags:
+      - Gastos
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegistrarPagoServicioFijo'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/RegistrarPagoServicioFijo'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/RegistrarPagoServicioFijo'
+        required: true
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Gasto'
+          description: ''
+        '400':
+          description: Monto inválido.
+        '404':
+          description: servicio_fijo_id inexistente.
+        '409':
+          description: Ya existe un pago de ese servicio en ese periodo.
+  /api/gastos/variacion-servicios/:
+    get:
+      operationId: gastos_variacion_servicios_list
+      description: Por cada periodo pagado de un servicio fijo, el % de variación
+        respecto al pago anterior.
+      summary: Variación mes a mes de un servicio fijo
+      parameters:
+      - in: query
+        name: servicio_fijo_id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - Gastos
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/VariacionServicio'
+          description: ''
+  /api/ingresos/:
+    get:
+      operationId: ingresos_list
+      description: Ingresos del usuario autenticado en el periodo (mes, año) indicado,
+        ordenados por fecha.
+      summary: Listar ingresos del periodo
+      parameters:
+      - in: query
+        name: anio
+        schema:
+          type: integer
+        description: Año del periodo.
+        required: true
+      - in: query
+        name: mes
+        schema:
+          type: integer
+        description: Mes del periodo (1-12).
+        required: true
+      tags:
+      - Ingresos
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Ingreso'
+          description: ''
+    post:
+      operationId: ingresos_create
+      description: Da de alta un ingreso del usuario autenticado en un periodo.
+      summary: Registrar un ingreso
+      tags:
+      - Ingresos
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Ingreso'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/Ingreso'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Ingreso'
+        required: true
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ingreso'
+          description: ''
+        '400':
+          description: Monto o periodo inválido.
+  /api/ingresos/total-periodo/:
+    get:
+      operationId: ingresos_total_periodo_retrieve
+      description: Suma de los ingresos del usuario autenticado en el periodo (mes,
+        año) indicado.
+      summary: Total de ingresos del periodo
+      parameters:
+      - in: query
+        name: anio
+        schema:
+          type: integer
+        description: Año del periodo.
+        required: true
+      - in: query
+        name: mes
+        schema:
+          type: integer
+        description: Mes del periodo (1-12).
+        required: true
+      tags:
+      - Ingresos
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TotalIngresosPeriodo'
+          description: ''
+  /api/planes-financieros/:
+    get:
+      operationId: planes_financieros_list
+      description: Todos los planes (activos e inactivos) del usuario autenticado,
+        más nuevo primero.
+      summary: Listar planes financieros
+      tags:
+      - Planes Financieros
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PlanFinanciero'
+          description: ''
+    post:
+      operationId: planes_financieros_create
+      description: Crea un plan (nace inactivo). Los 3 porcentajes deben sumar 100.
+      summary: Crear plan financiero
+      tags:
+      - Planes Financieros
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlanFinanciero'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PlanFinanciero'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PlanFinanciero'
+        required: true
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlanFinanciero'
+          description: ''
+        '400':
+          description: Los porcentajes no suman 100.
+  /api/planes-financieros/{plan_id}/:
+    patch:
+      operationId: planes_financieros_partial_update
+      description: Actualiza el plan `plan_id` del usuario autenticado. Los 3 porcentajes
+        deben sumar 100. Si se manda activo=true y había otro plan activo, ese otro
+        se desactiva primero (misma regla que /activar/).
+      summary: Actualizar plan financiero
+      parameters:
+      - in: path
+        name: plan_id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - Planes Financieros
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchedPlanFinanciero'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PatchedPlanFinanciero'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PatchedPlanFinanciero'
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlanFinanciero'
+          description: ''
+        '400':
+          description: Los porcentajes no suman 100.
+        '404':
+          description: No existe ese plan para este usuario.
+  /api/planes-financieros/{plan_id}/activar/:
+    post:
+      operationId: planes_financieros_activar_create
+      description: Marca `plan_id` como el plan activo del usuario, desactivando el
+        anterior si existía.
+      summary: Activar un plan financiero
+      parameters:
+      - in: path
+        name: plan_id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - Planes Financieros
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlanFinanciero'
+          description: ''
+        '404':
+          description: No existe el plan.
+  /api/planes-financieros/comparativa/:
+    get:
+      operationId: planes_financieros_comparativa_retrieve
+      description: Metas del plan activo (gasto fijo/ahorro/gasto libre) vs. ingresos
+        y gastos reales del periodo.
+      summary: Comparar plan activo vs. ejecución real
+      parameters:
+      - in: query
+        name: anio
+        schema:
+          type: integer
+        description: Año del periodo.
+        required: true
+      - in: query
+        name: mes
+        schema:
+          type: integer
+        description: Mes del periodo (1-12).
+        required: true
+      tags:
+      - Planes Financieros
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ComparativaPlanVsReal'
+          description: ''
+        '404':
+          description: El usuario no tiene un plan activo.
+  /api/servicios-fijos/:
+    get:
+      operationId: servicios_fijos_list
+      description: Servicios fijos activos (activo=True) del usuario autenticado,
+        ordenados por nombre.
+      summary: Listar servicios fijos activos
+      tags:
+      - Servicios Fijos
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ServicioFijo'
+          description: ''
+    post:
+      operationId: servicios_fijos_create
+      description: Da de alta un servicio fijo / gasto recurrente (ej. Internet, Agua,
+        Gimnasio).
+      summary: Crear servicio fijo
+      tags:
+      - Servicios Fijos
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ServicioFijo'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/ServicioFijo'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/ServicioFijo'
+        required: true
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServicioFijo'
+          description: ''
+        '400':
+          description: dia_vencimiento, monto_estimado o rango de fechas inválido.
+  /api/servicios-fijos/proximos-a-vencer/:
+    get:
+      operationId: servicios_fijos_proximos_a_vencer_list
+      description: Servicios fijos activos cuyo vencimiento cae dentro de su ventana
+        de anticipación, parado en `fecha` (por defecto, hoy). Insumo del generador
+        de alertas.
+      summary: Servicios próximos a vencer
+      parameters:
+      - in: query
+        name: fecha
+        schema:
+          type: string
+          format: date
+        description: Fecha de referencia (YYYY-MM-DD). Por defecto, hoy.
+      tags:
+      - Servicios Fijos
+      security:
+      - jwtAuth: []
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ServicioFijo'
+          description: ''
+  /api/usuarios/login/:
+    post:
+      operationId: usuarios_login_create
+      description: 'Valida email + contraseña. Si son correctos y el usuario está
+        activo, devuelve el usuario + un par de tokens JWT: guardá `access` y mandalo
+        como ''Authorization: Bearer <access>'' en el resto de la API.'
+      summary: Login
+      tags:
+      - Usuarios
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Login'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/Login'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Login'
+        required: true
+      security:
+      - {}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenAuth'
+          description: ''
+        '401':
+          description: Email o contraseña incorrectos, o usuario inactivo.
+  /api/usuarios/registro/:
+    post:
+      operationId: usuarios_registro_create
+      description: Alta de usuario (crea el perfil en `usuarios` y su auth.User vinculado).
+        El email debe ser único; la contraseña se guarda hasheada. Devuelve el usuario
+        ya autenticado (access + refresh), no hace falta llamar a /login/ después.
+      summary: Registrar un usuario nuevo
+      tags:
+      - Usuarios
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegistroUsuario'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/RegistroUsuario'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/RegistroUsuario'
+        required: true
+      security:
+      - {}
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenAuth'
+          description: ''
+        '400':
+          description: Ya existe un usuario con ese email.
+  /api/usuarios/token/refresh/:
+    post:
+      operationId: usuarios_token_refresh_create
+      description: |-
+        Takes a refresh type JSON web token and returns an access type JSON web
+        token if the refresh token is valid.
+      tags:
+      - usuarios
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenRefresh'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/TokenRefresh'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/TokenRefresh'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenRefresh'
+          description: ''
+components:
+  schemas:
+    AhorroEmergencia:
+      type: object
+      properties:
+        prioridad:
+          type: string
+        nivel_orden:
+          type: integer
+        total_periodo:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,12}(?:\.\d{0,2})?$
+        ahorro_acumulado_si_suspende:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,12}(?:\.\d{0,2})?$
+      required:
+      - ahorro_acumulado_si_suspende
+      - nivel_orden
+      - prioridad
+      - total_periodo
+    AlertaPago:
+      type: object
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        usuario_id:
+          type: integer
+          readOnly: true
+        servicio_fijo_id:
+          type: integer
+        gasto_id:
+          type: integer
+          readOnly: true
+          nullable: true
+        periodo_mes:
+          type: integer
+          maximum: 12
+          minimum: 1
+        periodo_anio:
+          type: integer
+        fecha_alerta:
+          type: string
+          format: date
+        estado:
+          allOf:
+          - $ref: '#/components/schemas/AlertaPagoEstadoEnum'
+          readOnly: true
+        mensaje:
+          type: string
+          nullable: true
+      required:
+      - estado
+      - fecha_alerta
+      - gasto_id
+      - id
+      - periodo_anio
+      - periodo_mes
+      - servicio_fijo_id
+      - usuario_id
+    AlertaPagoEstadoEnum:
+      enum:
+      - Pendiente
+      - Enviada
+      - Leida
+      - Resuelta
+      type: string
+      description: |-
+        * `Pendiente` - Pendiente
+        * `Enviada` - Enviada
+        * `Leida` - Leida
+        * `Resuelta` - Resuelta
+    BalanceMensual:
+      type: object
+      properties:
+        usuario_id:
+          type: integer
+        periodo_mes:
+          type: integer
+        periodo_anio:
+          type: integer
+        total_ingresos:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,12}(?:\.\d{0,2})?$
+        total_gastos:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,12}(?:\.\d{0,2})?$
+        balance:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,12}(?:\.\d{0,2})?$
+      required:
+      - balance
+      - periodo_anio
+      - periodo_mes
+      - total_gastos
+      - total_ingresos
+      - usuario_id
+    CambiarEstadoAlertaEstadoEnum:
+      enum:
+      - Enviada
+      - Leida
+      type: string
+      description: |-
+        * `Enviada` - Enviada
+        * `Leida` - Leida
+    CategoriaGasto:
+      type: object
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        usuario_id:
+          type: integer
+          readOnly: true
+          nullable: true
+        nombre:
+          type: string
+          maxLength: 100
+        icono:
+          type: string
+          nullable: true
+          maxLength: 50
+      required:
+      - id
+      - nombre
+      - usuario_id
+    ComparativaPlanVsReal:
+      type: object
+      properties:
+        usuario_id:
+          type: integer
+        periodo_mes:
+          type: integer
+        periodo_anio:
+          type: integer
+        total_ingresos:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,12}(?:\.\d{0,2})?$
+        meta_gasto_fijo:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,12}(?:\.\d{0,2})?$
+        meta_ahorro:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,12}(?:\.\d{0,2})?$
+        meta_gasto_libre:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,12}(?:\.\d{0,2})?$
+        gasto_real:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,12}(?:\.\d{0,2})?$
+        balance_real:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,12}(?:\.\d{0,2})?$
+      required:
+      - balance_real
+      - gasto_real
+      - meta_ahorro
+      - meta_gasto_fijo
+      - meta_gasto_libre
+      - periodo_anio
+      - periodo_mes
+      - total_ingresos
+      - usuario_id
+    Gasto:
+      type: object
+      description: Salida generica de un Gasto y entrada de un gasto puntual.
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        usuario_id:
+          type: integer
+          readOnly: true
+        categoria_id:
+          type: integer
+        servicio_fijo_id:
+          type: integer
+          readOnly: true
+          nullable: true
+        prioridad_id:
+          type: integer
+        monto:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,10}(?:\.\d{0,2})?$
+        fecha_gasto:
+          type: string
+          format: date
+        periodo_mes:
+          type: integer
+          maximum: 12
+          minimum: 1
+        periodo_anio:
+          type: integer
+        estado:
+          allOf:
+          - $ref: '#/components/schemas/GastoEstadoEnum'
+          default: Pagado
+        descripcion:
+          type: string
+          nullable: true
+      required:
+      - categoria_id
+      - fecha_gasto
+      - id
+      - monto
+      - periodo_anio
+      - periodo_mes
+      - prioridad_id
+      - servicio_fijo_id
+      - usuario_id
+    GastoEstadoEnum:
+      enum:
+      - Pagado
+      - Pendiente
+      - Vencido
+      type: string
+      description: |-
+        * `Pagado` - Pagado
+        * `Pendiente` - Pendiente
+        * `Vencido` - Vencido
+    Ingreso:
+      type: object
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        usuario_id:
+          type: integer
+          readOnly: true
+        monto:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,10}(?:\.\d{0,2})?$
+        fecha:
+          type: string
+          format: date
+        periodo_mes:
+          type: integer
+          maximum: 12
+          minimum: 1
+        periodo_anio:
+          type: integer
+        fuente:
+          type: string
+          nullable: true
+          maxLength: 100
+        descripcion:
+          type: string
+          nullable: true
+      required:
+      - fecha
+      - id
+      - monto
+      - periodo_anio
+      - periodo_mes
+      - usuario_id
+    Login:
+      type: object
+      description: Entrada de POST /api/usuarios/login/.
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 150
+        password:
+          type: string
+          writeOnly: true
+      required:
+      - email
+      - password
+    NivelPrioridad:
+      type: object
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        nombre:
+          type: string
+          maxLength: 50
+        nivel_orden:
+          type: integer
+        descripcion:
+          type: string
+          nullable: true
+        color:
+          type: string
+          nullable: true
+          maxLength: 20
+      required:
+      - id
+      - nivel_orden
+      - nombre
+    PatchedCambiarEstadoAlerta:
+      type: object
+      description: 'Entrada de PATCH /api/alertas/<id>/ : a que estado pasar.'
+      properties:
+        estado:
+          $ref: '#/components/schemas/CambiarEstadoAlertaEstadoEnum'
+    PatchedPlanFinanciero:
+      type: object
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        usuario_id:
+          type: integer
+          readOnly: true
+        nombre:
+          type: string
+          default: Mi plan
+          maxLength: 100
+        porcentaje_gasto_fijo:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,3}(?:\.\d{0,2})?$
+        porcentaje_ahorro:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,3}(?:\.\d{0,2})?$
+        porcentaje_gasto_libre:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,3}(?:\.\d{0,2})?$
+        fecha_inicio:
+          type: string
+          format: date
+        fecha_fin:
+          type: string
+          format: date
+          nullable: true
+        activo:
+          type: boolean
+    PlanFinanciero:
+      type: object
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        usuario_id:
+          type: integer
+          readOnly: true
+        nombre:
+          type: string
+          default: Mi plan
+          maxLength: 100
+        porcentaje_gasto_fijo:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,3}(?:\.\d{0,2})?$
+        porcentaje_ahorro:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,3}(?:\.\d{0,2})?$
+        porcentaje_gasto_libre:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,3}(?:\.\d{0,2})?$
+        fecha_inicio:
+          type: string
+          format: date
+        fecha_fin:
+          type: string
+          format: date
+          nullable: true
+        activo:
+          type: boolean
+      required:
+      - id
+      - porcentaje_ahorro
+      - porcentaje_gasto_fijo
+      - porcentaje_gasto_libre
+      - usuario_id
+    RegistrarPagoServicioFijo:
+      type: object
+      description: |-
+        Entrada de POST /api/gastos/pagos-servicio/. categoria_id y
+        prioridad_id NO van acá: la vista los deduce del propio servicio
+        fijo (servicio.categoria_id / servicio.prioridad_id).
+      properties:
+        servicio_fijo_id:
+          type: integer
+        monto:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,10}(?:\.\d{0,2})?$
+        fecha_gasto:
+          type: string
+          format: date
+        periodo_mes:
+          type: integer
+          maximum: 12
+          minimum: 1
+        periodo_anio:
+          type: integer
+        descripcion:
+          type: string
+          nullable: true
+      required:
+      - fecha_gasto
+      - monto
+      - periodo_anio
+      - periodo_mes
+      - servicio_fijo_id
+    RegistroUsuario:
+      type: object
+      description: Entrada de POST /api/usuarios/registro/.
+      properties:
+        nombre:
+          type: string
+          maxLength: 150
+        email:
+          type: string
+          format: email
+          maxLength: 150
+        password:
+          type: string
+          writeOnly: true
+          minLength: 8
+      required:
+      - email
+      - nombre
+      - password
+    ServicioFijo:
+      type: object
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        usuario_id:
+          type: integer
+          readOnly: true
+        categoria_id:
+          type: integer
+        prioridad_id:
+          type: integer
+        nombre:
+          type: string
+          maxLength: 150
+        dia_vencimiento:
+          type: integer
+          maximum: 31
+          minimum: 1
+        monto_estimado:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,10}(?:\.\d{0,2})?$
+          nullable: true
+        es_monto_variable:
+          type: boolean
+          default: false
+        dias_anticipacion_alerta:
+          type: integer
+          minimum: 0
+          default: 3
+        activo:
+          type: boolean
+          readOnly: true
+        fecha_inicio:
+          type: string
+          format: date
+        fecha_fin:
+          type: string
+          format: date
+          nullable: true
+        notas:
+          type: string
+          nullable: true
+      required:
+      - activo
+      - categoria_id
+      - dia_vencimiento
+      - id
+      - nombre
+      - prioridad_id
+      - usuario_id
+    TokenAuth:
+      type: object
+      description: |-
+        Salida de registro/login: el usuario + el par de tokens JWT.
+        El front guarda `access` y lo manda como
+        'Authorization: Bearer <access>' en cada request. Cuando expira
+        (ACCESS_TOKEN_LIFETIME, ver settings), usa `refresh` contra
+        POST /api/usuarios/token/refresh/ para obtener un access nuevo sin
+        volver a pedir la contrasena.
+      properties:
+        usuario:
+          $ref: '#/components/schemas/Usuario'
+        access:
+          type: string
+        refresh:
+          type: string
+      required:
+      - access
+      - refresh
+      - usuario
+    TokenRefresh:
+      type: object
+      properties:
+        access:
+          type: string
+          readOnly: true
+        refresh:
+          type: string
+          writeOnly: true
+      required:
+      - access
+      - refresh
+    TotalIngresosPeriodo:
+      type: object
+      description: Salida de GET /api/ingresos/total-periodo/.
+      properties:
+        periodo_mes:
+          type: integer
+        periodo_anio:
+          type: integer
+        total_ingresos:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,12}(?:\.\d{0,2})?$
+      required:
+      - periodo_anio
+      - periodo_mes
+      - total_ingresos
+    Usuario:
+      type: object
+      description: 'Salida: lo que la API devuelve de un Usuario.'
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        nombre:
+          type: string
+          maxLength: 150
+        email:
+          type: string
+          format: email
+          maxLength: 150
+        fecha_registro:
+          type: string
+          format: date-time
+          readOnly: true
+        activo:
+          type: boolean
+          readOnly: true
+      required:
+      - activo
+      - email
+      - fecha_registro
+      - id
+      - nombre
+    VariacionServicio:
+      type: object
+      properties:
+        servicio_fijo_id:
+          type: integer
+        servicio:
+          type: string
+        periodo_mes:
+          type: integer
+        periodo_anio:
+          type: integer
+        monto_actual:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,10}(?:\.\d{0,2})?$
+        monto_anterior:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,10}(?:\.\d{0,2})?$
+          nullable: true
+        porcentaje_variacion:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,5}(?:\.\d{0,2})?$
+          nullable: true
+      required:
+      - monto_actual
+      - monto_anterior
+      - periodo_anio
+      - periodo_mes
+      - porcentaje_variacion
+      - servicio
+      - servicio_fijo_id
+  securitySchemes:
+    basicAuth:
+      type: http
+      scheme: basic
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: sessionid
+    jwtAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT

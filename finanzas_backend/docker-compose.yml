@@ -1,0 +1,80 @@
+# Stack autocontenido de finanzas_backend: Postgres + la API Django.
+# Uso:
+#   cd finanzas_backend
+#   docker compose up --build
+#   docker compose exec backend uv run manage.py createsuperuser
+#
+# Al primer arranque, Postgres carga schema_finanzas.sql y
+# 02_seed_test_data.sql automaticamente (docker-entrypoint-initdb.d/ solo
+# corre en una base de datos NUEVA/vacia). Si ya tenias el volumen creado
+# de una corrida anterior sin datos, borralo con:
+#   docker compose down -v
+#
+# Este compose es independiente del de finanzas_db/ (usa otro nombre de
+# contenedor/volumen y el puerto 5432 en vez de 5433), asi que podes
+# tener los dos definidos sin que choquen.
+
+name: finanzas_backend
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: finanzas_backend_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: finanzas_user
+      POSTGRES_PASSWORD: finanzas_pass
+      POSTGRES_DB: finanzas_db
+    ports:
+      # host:contenedor -- 5434 para no chocar con un Postgres local en
+      # el 5432 por defecto, ni con finanzas_db/docker-compose.yml (5433).
+      # Cambialo si tambien lo tenes ocupado.
+      - "5434:5432"
+    volumes:
+      - finanzas_backend_pgdata:/var/lib/postgresql/data
+      - ../finanzas_db/schema_finanzas.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ../finanzas_db/02_seed_test_data.sql:/docker-entrypoint-initdb.d/02_seed_test_data.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finanzas_user -d finanzas_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: .
+    container_name: finanzas_backend_api
+    restart: unless-stopped
+    # migrate aplica solo las tablas propias de Django (auth, sessions,
+    # admin, contenttypes): los modelos de dominio son managed=False, sus
+    # tablas ya las crea el schema.sql de arriba.
+    command: sh -c "uv run manage.py migrate && uv run manage.py runserver 0.0.0.0:8000"
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.dev
+      DJANGO_SECRET_KEY: django-insecure-solo-para-desarrollo-local
+      POSTGRES_DB: finanzas_db
+      POSTGRES_USER: finanzas_user
+      POSTGRES_PASSWORD: finanzas_pass
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      EMAIL_BACKEND: django.core.mail.backends.smtp.EmailBackend
+      EMAIL_HOST: smtp.gmail.com
+      EMAIL_PORT: "465"
+      EMAIL_HOST_USER: tusfinanzas100@gmail.com
+      EMAIL_HOST_PASSWORD: boqz rhss ncor pxqz
+      EMAIL_USE_TLS: "True"
+      DEFAULT_FROM_EMAIL: no-reply@gmail.com
+    ports:
+      - "8000:8000"
+    volumes:
+      # Codigo montado desde el host: cambios se reflejan sin rebuild
+      # (runserver recarga solo). El venv queda en un volumen aparte para
+      # no perder lo instalado en la imagen al montar el codigo encima.
+      - .:/app
+      - finanzas_backend_venv:/app/.venv
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  finanzas_backend_pgdata:
+  finanzas_backend_venv:

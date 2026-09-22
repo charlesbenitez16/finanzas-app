@@ -1,0 +1,320 @@
+================================================================================
+GUÍA DE SOLUCIÓN — MÓDULO planes_financieros
+================================================================================
+Entidad PLAN_FINANCIERO / tabla `plan_financiero`. Reparto del ingreso
+estilo 50/30/20 personalizable. Reglas clave:
+  - los 3 porcentajes suman 100 (CHECK del schema)
+  - un solo plan activo por usuario (uq_plan_activo_usuario, índice parcial)
+  - vista_plan_vs_real: metas del plan vs. ejecución real de un mes.
+
+
+--------------------------------------------------------------------------------
+1. domain/entities.py  ->  PlanFinanciero
+--------------------------------------------------------------------------------
+    from decimal import Decimal, ROUND_HALF_UP
+
+    def porcentajes_suman_100(self) -> bool:
+        suma = (self.porcentaje_gasto_fijo + self.porcentaje_ahorro
+                + self.porcentaje_gasto_libre)
+        return suma == Decimal("100")
+
+    def esta_activo(self) -> bool:
+        return self.activo
+
+    def esta_vigente(self, fecha) -> bool:
+        if self.fecha_inicio and fecha < self.fecha_inicio:
+            return False
+        if self.fecha_fin and fecha > self.fecha_fin:
+            return False
+        return True
+
+    def _meta(self, ingreso_total: Decimal, porcentaje: Decimal) -> Decimal:
+        return (ingreso_total * porcentaje / Decimal("100")).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def meta_gasto_fijo(self, ingreso_total: Decimal) -> Decimal:
+        return self._meta(ingreso_total, self.porcentaje_gasto_fijo)
+
+    def meta_ahorro(self, ingreso_total: Decimal) -> Decimal:
+        return self._meta(ingreso_total, self.porcentaje_ahorro)
+
+    def meta_gasto_libre(self, ingreso_total: Decimal) -> Decimal:
+        return self._meta(ingreso_total, self.porcentaje_gasto_libre)
+
+POR QUÉ:
+- porcentajes_suman_100() SÍ va en la entidad, y este es el CONTRAEJEMPLO
+  explícito de la lección de catalogos: NivelPrioridad no podía decidir
+  sola si era "la más baja" porque necesitaba ver a sus hermanas. Acá los
+  3 porcentajes son atributos DEL MISMO plan -> la entidad tiene todo lo
+  que necesita para validar su invariante.
+- GOTCHA de Decimal: si los porcentajes llegan como Decimal (del
+  serializer o de la base), `50 + 20 + 30 == Decimal("100")` funciona. Si
+  hubiera floats de por medio, usá `abs(suma - Decimal("100")) < Decimal("0.01")`.
+- _meta() aplica ROUND(x, 2) como hace vista_plan_vs_real
+  (`ROUND(b.total_ingresos * pf.porcentaje_gasto_fijo / 100, 2)`).
+- esta_vigente(): misma forma que en servicios_fijos / ingresos.
+
+
+--------------------------------------------------------------------------------
+2. domain/ports/repositories.py
+--------------------------------------------------------------------------------
+Interfaz ABC completa. obtener_plan_activo(usuario_id) es la traducción de
+lo que garantiza uq_plan_activo_usuario y lo que consume vista_plan_vs_real
+(`WHERE pf.activo = TRUE`).
+
+
+--------------------------------------------------------------------------------
+3. infrastructure/repositories.py  ->  DjangoPlanFinancieroRepository
+--------------------------------------------------------------------------------
+    from typing import Optional
+
+    def _a_entidad(self, m):
+        return PlanFinanciero(
+            id=m.id, usuario_id=m.usuario_id, nombre=m.nombre,
+            porcentaje_gasto_fijo=m.porcentaje_gasto_fijo,
+            porcentaje_ahorro=m.porcentaje_ahorro,
+            porcentaje_gasto_libre=m.porcentaje_gasto_libre,
+            fecha_inicio=m.fecha_inicio, fecha_fin=m.fecha_fin, activo=m.activo,
+        )
+
+    def obtener_por_id(self, plan_id):
+        try:
+            return self._a_entidad(PlanFinancieroModel.objects.get(id=plan_id))
+        except PlanFinancieroModel.DoesNotExist:
+            return None
+
+    def crear(self, plan):
+        m = PlanFinancieroModel.objects.create(
+            usuario_id=plan.usuario_id, nombre=plan.nombre,
+            porcentaje_gasto_fijo=plan.porcentaje_gasto_fijo,
+            porcentaje_ahorro=plan.porcentaje_ahorro,
+            porcentaje_gasto_libre=plan.porcentaje_gasto_libre,
+            fecha_inicio=plan.fecha_inicio, fecha_fin=plan.fecha_fin,
+            activo=plan.activo,
+        )
+        return self._a_entidad(m)
+
+    def actualizar(self, plan):
+        PlanFinancieroModel.objects.filter(id=plan.id).update(
+            nombre=plan.nombre, porcentaje_gasto_fijo=plan.porcentaje_gasto_fijo,
+            porcentaje_ahorro=plan.porcentaje_ahorro,
+            porcentaje_gasto_libre=plan.porcentaje_gasto_libre,
+            fecha_inicio=plan.fecha_inicio, fecha_fin=plan.fecha_fin,
+            activo=plan.activo,
+        )
+        return plan
+
+    def listar_por_usuario(self, usuario_id):
+        qs = PlanFinancieroModel.objects.filter(usuario_id=usuario_id).order_by("-fecha_inicio")
+        return [self._a_entidad(m) for m in qs]
+
+    def obtener_plan_activo(self, usuario_id):
+        m = PlanFinancieroModel.objects.filter(usuario_id=usuario_id, activo=True).first()
+        return self._a_entidad(m) if m else None
+
+
+--------------------------------------------------------------------------------
+4. application/use_cases/
+--------------------------------------------------------------------------------
+4.1 crear_plan_financiero.py
+
+    from datetime import date
+
+    def ejecutar(self, usuario_id, porcentaje_gasto_fijo, porcentaje_ahorro,
+                 porcentaje_gasto_libre, nombre="Mi plan",
+                 fecha_inicio=None, fecha_fin=None):
+        plan = PlanFinanciero(
+            usuario_id=usuario_id, nombre=nombre,
+            porcentaje_gasto_fijo=porcentaje_gasto_fijo,
+            porcentaje_ahorro=porcentaje_ahorro,
+            porcentaje_gasto_libre=porcentaje_gasto_libre,
+            fecha_inicio=fecha_inicio or date.today(), fecha_fin=fecha_fin,
+            activo=False,                    # nace INACTIVO
+        )
+        if not plan.porcentajes_suman_100():
+            raise PorcentajesNoSuman100("Los porcentajes deben sumar 100")
+        return self.repositorio.crear(plan)
+
+  POR QUÉ nace inactivo: evita el choque con uq_plan_activo_usuario al
+  crear un segundo plan, y hace de "cuál es el plan activo" una acción
+  explícita (ActivarPlanFinancieroUseCase). Alternativa: crear activo y
+  desactivar el anterior en la misma transacción — más "mágico".
+
+4.2 activar_plan_financiero.py
+
+    from django.db import transaction
+
+    def ejecutar(self, plan_id):
+        plan = self.repositorio.obtener_por_id(plan_id)
+        if plan is None:
+            raise PlanNoEncontrado(f"No existe el plan {plan_id}")
+        with transaction.atomic():
+            activo = self.repositorio.obtener_plan_activo(plan.usuario_id)
+            if activo is not None and activo.id != plan.id:
+                activo.activo = False
+                self.repositorio.actualizar(activo)     # DESACTIVAR primero
+            plan.activo = True
+            return self.repositorio.actualizar(plan)    # ACTIVAR después
+
+  POR QUÉ este orden: uq_plan_activo_usuario es
+  `UNIQUE(usuario_id) WHERE activo = TRUE`. Si activás el nuevo antes de
+  desactivar el viejo, hay un instante con 2 filas activas -> IntegrityError.
+  transaction.atomic() asegura que un crash entre los 2 UPDATE no deje al
+  usuario sin ningún plan activo. Importar django.db.transaction en
+  application/ es un compromiso pragmático; la versión "pura" sería un
+  puerto Unit-of-Work.
+
+4.3 obtener_plan_activo.py
+    def ejecutar(self, usuario_id):
+        return self.repositorio.obtener_plan_activo(usuario_id)
+
+4.4 comparar_plan_vs_real.py   (vista D)
+
+    def ejecutar(self, usuario_id, periodo_mes, periodo_anio):
+        plan = self.plan_repositorio.obtener_plan_activo(usuario_id)
+        if plan is None:
+            raise PlanNoEncontrado("El usuario no tiene un plan activo")
+        balance = self.calcular_balance.ejecutar(usuario_id, periodo_mes, periodo_anio)
+        ingresos = balance.total_ingresos
+        return ComparativaPlanVsReal(
+            usuario_id=usuario_id, periodo_mes=periodo_mes, periodo_anio=periodo_anio,
+            total_ingresos=ingresos,
+            meta_gasto_fijo=plan.meta_gasto_fijo(ingresos),
+            meta_ahorro=plan.meta_ahorro(ingresos),
+            meta_gasto_libre=plan.meta_gasto_libre(ingresos),
+            gasto_real=balance.total_gastos,
+            balance_real=balance.balance,
+        )
+
+  POR QUÉ compone CalcularBalanceMensualUseCase en vez de re-consultar:
+  vista_plan_vs_real literalmente hace `JOIN vista_balance_mensual`. Se
+  inyecta el CASO DE USO ya armado (no los repos de ingresos/gastos) para
+  que este módulo no conozca esa infraestructura.
+
+
+--------------------------------------------------------------------------------
+5. interfaces/api/  (views)
+--------------------------------------------------------------------------------
+    from modules.gastos.application.use_cases.calcular_balance_mensual import CalcularBalanceMensualUseCase
+    from modules.gastos.infrastructure.repositories import DjangoGastoRepository
+    from modules.ingresos.infrastructure.repositories import DjangoIngresoRepository
+
+    class PlanesFinancierosView(APIView):
+        def get(self, request):
+            repo = DjangoPlanFinancieroRepository()
+            planes = repo.listar_por_usuario(request.user.id)
+            return Response(PlanFinancieroSerializer(planes, many=True).data)
+
+        def post(self, request):
+            e = PlanFinancieroSerializer(data=request.data); e.is_valid(raise_exception=True)
+            caso = CrearPlanFinancieroUseCase(repositorio=DjangoPlanFinancieroRepository())
+            try:
+                plan = caso.ejecutar(
+                    usuario_id=request.user.id,
+                    porcentaje_gasto_fijo=e.validated_data["porcentaje_gasto_fijo"],
+                    porcentaje_ahorro=e.validated_data["porcentaje_ahorro"],
+                    porcentaje_gasto_libre=e.validated_data["porcentaje_gasto_libre"],
+                    nombre=e.validated_data.get("nombre", "Mi plan"),
+                    fecha_inicio=e.validated_data.get("fecha_inicio"),
+                    fecha_fin=e.validated_data.get("fecha_fin"),
+                )
+            except PorcentajesNoSuman100 as ex:
+                return Response({"detail": str(ex)}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(PlanFinancieroSerializer(plan).data, status=status.HTTP_201_CREATED)
+
+    class ActivarPlanView(APIView):
+        def post(self, request, plan_id):
+            caso = ActivarPlanFinancieroUseCase(repositorio=DjangoPlanFinancieroRepository())
+            try:
+                plan = caso.ejecutar(plan_id)
+            except PlanNoEncontrado as ex:
+                return Response({"detail": str(ex)}, status=status.HTTP_404_NOT_FOUND)
+            return Response(PlanFinancieroSerializer(plan).data)
+
+    class ComparativaView(APIView):
+        def get(self, request):
+            mes, anio = leer_periodo(request)
+            caso = CompararPlanVsRealUseCase(
+                plan_repositorio=DjangoPlanFinancieroRepository(),
+                calcular_balance=CalcularBalanceMensualUseCase(
+                    ingreso_repositorio=DjangoIngresoRepository(),
+                    gasto_repositorio=DjangoGastoRepository(),
+                ),
+            )
+            try:
+                comp = caso.ejecutar(request.user.id, mes, anio)
+            except PlanNoEncontrado as ex:
+                return Response({"detail": str(ex)}, status=status.HTTP_404_NOT_FOUND)
+            return Response(ComparativaPlanVsRealSerializer(comp).data)
+
+Opcional en PlanFinancieroSerializer: validar en .validate() que los 3
+porcentajes sumen 100 (defensa en profundidad; el caso de uso ya lo hace).
+
+
+--------------------------------------------------------------------------------
+6. tests
+--------------------------------------------------------------------------------
+Doble en memoria:
+
+    from dataclasses import replace
+
+    def obtener_por_id(self, plan_id):
+        return next((p for p in self._planes if p.id == plan_id), None)
+
+    def crear(self, plan):
+        creado = replace(plan, id=self._siguiente_id)
+        self._planes.append(creado); self._siguiente_id += 1
+        return creado
+
+    def actualizar(self, plan):
+        self._planes = [plan if p.id == plan.id else p for p in self._planes]
+        return plan
+
+    def listar_por_usuario(self, usuario_id):
+        return [p for p in self._planes if p.usuario_id == usuario_id]
+
+    def obtener_plan_activo(self, usuario_id):
+        return next((p for p in self._planes if p.usuario_id == usuario_id and p.activo), None)
+
+Ejemplos:
+
+    def test_porcentajes_que_no_suman_100_lanzan_PorcentajesNoSuman100(self):
+        caso = CrearPlanFinancieroUseCase(repositorio=RepositorioPlanFinancieroFalso())
+        with self.assertRaises(PorcentajesNoSuman100):
+            caso.ejecutar(usuario_id=1, porcentaje_gasto_fijo=Decimal("50"),
+                          porcentaje_ahorro=Decimal("20"), porcentaje_gasto_libre=Decimal("40"))
+
+    def test_activar_desactiva_el_plan_activo_anterior(self):
+        repo = RepositorioPlanFinancieroFalso([
+            PlanFinanciero(id=1, usuario_id=7, activo=True),
+            PlanFinanciero(id=2, usuario_id=7, activo=False),
+        ])
+        ActivarPlanFinancieroUseCase(repositorio=repo).ejecutar(2)
+        self.assertFalse(repo.obtener_por_id(1).activo)
+        self.assertTrue(repo.obtener_por_id(2).activo)
+
+    def test_metas_son_porcentajes_del_total_de_ingresos(self):
+        p = PlanFinanciero(porcentaje_gasto_fijo=Decimal("50"),
+                           porcentaje_ahorro=Decimal("20"),
+                           porcentaje_gasto_libre=Decimal("30"))
+        self.assertEqual(p.meta_gasto_fijo(Decimal("800000")), Decimal("400000.00"))
+
+Nota: para test_activar..., como el doble no impone el índice único
+parcial, alcanza con verificar el efecto. Para probar el CONFLICTO real
+(2 activos) está el test de infrastructure, cuya tabla de setUpClass ya
+crea uq_plan_activo_usuario.
+
+
+--------------------------------------------------------------------------------
+7. VERIFICACIÓN MANUAL
+--------------------------------------------------------------------------------
+    uv run python -m unittest modules.planes_financieros.tests.domain.test_entities \
+        modules.planes_financieros.tests.application.test_use_cases -v
+
+    # seed carga "Plan 2026" 50/20/30 activo:
+    GET  /api/planes-financieros/
+    GET  /api/planes-financieros/comparativa/?mes=3&anio=2026
+      -> total_ingresos 1020000 ; meta_gasto_fijo 510000.00 ; meta_ahorro 204000.00 ;
+         meta_gasto_libre 306000.00 ; gasto_real y balance_real de marzo.
+    POST /api/planes-financieros/  con porcentajes que no suman 100 -> 400
+================================================================================

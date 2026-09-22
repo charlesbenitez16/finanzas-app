@@ -1,0 +1,276 @@
+RESUMEN DE IMPLEMENTACION - FRONTEND FINANZAS
+================================================
+Fecha: 2026-09-16
+Alcance: creación desde cero de finanzas_frontend/, conectado en vivo a
+finanzas_backend/ (Django + DRF, JWT, 23 endpoints en 7 módulos).
+
+
+1. DECISIONES DE ARRANQUE (confirmadas con el usuario)
+-------------------------------------------------------
+- Ubicación: finanzas_frontend/, carpeta hermana de finanzas_backend/,
+  dentro de proyecto_finanzas/.
+- Lenguaje: TypeScript (no JavaScript) — para poder generar tipos
+  automáticamente desde el OpenAPI del backend y detectar errores de
+  integración en tiempo de compilación en vez de en runtime.
+- Gestor de paquetes: pnpm.
+- Librería de componentes: shadcn/ui sobre Tailwind CSS v4 (en vez de
+  Tailwind a mano o una librería de componentes cerrada tipo Mantine).
+
+
+2. PROBLEMAS DE ENTORNO ENCONTRADOS Y RESUELTOS
+-------------------------------------------------------
+- Node del sistema era v12.22.12 (con npm roto: "Cannot find module
+  'node:path'"), incompatible con Vite. Se detectó que ya había `nvm`
+  instalado pero sin ninguna versión moderna descargada.
+  Solución: `nvm install --lts` (instaló Node 24.21.0), `nvm alias
+  default 24` para que quede como versión por defecto del usuario.
+  Se agregó un archivo `.nvmrc` con "24" en la raíz del frontend para
+  que cualquier `nvm use` futuro en esa carpeta resuelva la versión
+  correcta automáticamente.
+- pnpm no estaba instalado: se activó vía corepack
+  (`corepack enable && corepack prepare pnpm@latest --activate`).
+- IMPORTANTE: cada terminal nueva NO hereda automáticamente el Node 24
+  (nvm no está enganchado al arranque de shell no interactivo en este
+  entorno). Hay que correr, en cada sesión de terminal nueva:
+      export NVM_DIR="$HOME/.nvm" && source "$NVM_DIR/nvm.sh" && nvm use 24
+  o simplemente `nvm use` parado en finanzas_frontend/ (usa el .nvmrc).
+
+
+3. CÓMO SE CONECTA EL FRONTEND AL BACKEND (lo más importante)
+-------------------------------------------------------
+3.1. Sin configurar CORS en el backend
+   En vez de tocar Django para permitir peticiones cross-origin desde
+   localhost:5173, se configuró un proxy de desarrollo en
+   vite.config.ts: todo lo que el navegador pide a "/api/*" en el
+   puerto 5173 lo reenvía Vite internamente a http://localhost:8000.
+   Para el navegador, front y back son el mismo origen. Esto es solo
+   para `pnpm dev`; en producción, si el front no queda detrás del
+   mismo dominio/reverse proxy que el back, hay que definir
+   VITE_API_BASE_URL con la URL completa del backend (ver .env.example)
+   y ahí sí habría que activar django-cors-headers en el backend.
+
+3.2. Cliente HTTP tipado, generado desde el propio backend
+   - Se corrió `openapi-typescript ../finanzas_backend/docs/openapi.json
+     -o src/api/schema.d.ts` para generar automáticamente todos los
+     tipos TypeScript (23 endpoints, todos los schemas: Usuario,
+     Ingreso, Gasto, ServicioFijo, PlanFinanciero, AlertaPago,
+     CategoriaGasto, NivelPrioridad, etc.) a partir del spec real del
+     backend. No hay un solo tipo de request/response escrito a mano.
+   - Se agregó el script `pnpm gen:api` en package.json para volver a
+     generarlos cuando el backend cambie (documentado en el README).
+   - El cliente en sí (src/api/client.ts) usa la librería `openapi-fetch`
+     (no axios — se instaló axios primero y después se reemplazó, para
+     no mantener dos formas distintas de tipar llamadas a la API).
+
+3.3. Autenticación JWT (siguiendo el flujo de docs/API_REFERENCE.md)
+   - Login (`POST /api/usuarios/login/`) y Registro
+     (`POST /api/usuarios/registro/`) devuelven {usuario, access, refresh}.
+   - `access` se guarda SOLO en memoria (store de zustand,
+     src/stores/auth-store.ts) — nunca toca localStorage, para reducir
+     superficie de ataque ante XSS.
+   - `refresh` se persiste en localStorage para sobrevivir a que el
+     usuario cierre y reabra la pestaña.
+   - src/lib/jwt.ts decodifica el `exp` del JWT (sin librerías, solo
+     parseando el payload base64) para saber si el access token está por
+     vencer.
+   - El middleware de openapi-fetch (src/api/client.ts):
+       * Antes de cada request (salvo a /api/usuarios/*): si no hay
+         access en memoria, o si el que hay vence en menos de 10s,
+         pide uno nuevo a POST /api/usuarios/token/refresh/ ANTES de
+         mandar la petición original (refresh proactivo, no reactivo:
+         evita la complejidad de "reintentar" una request ya enviada,
+         que con streams de body es frágil).
+       * Las llamadas de refresh en paralelo se deduplican (una sola
+         promesa compartida) para no disparar 10 refresh simultáneos si
+         hay 10 queries pidiendo datos a la vez al cargar una página.
+       * Si igual llega un 401 (refresh también vencido/inválido), se
+         limpia la sesión (clearSession) y como ProtectedRoute está
+         suscrito al store, la UI redirige sola a /login.
+   - Esto se probó de punta a punta con un navegador real (ver sección
+     7): registro -> recargar la página -> la sesión sigue viva porque
+     el refresh token en localStorage renueva el access solo, sin pedir
+     la contraseña de nuevo.
+
+
+4. ESTRUCTURA DE CARPETAS CREADA
+-------------------------------------------------------
+finanzas_frontend/
+  .nvmrc                        -> fija Node 24 para este proyecto
+  .env.example                  -> documenta VITE_API_BASE_URL (opcional)
+  README.md                     -> instrucciones de uso completas
+  vite.config.ts                -> plugin de Tailwind v4, alias "@/*",
+                                    proxy /api -> localhost:8000
+  components.json               -> config de shadcn/ui (preset "Nova")
+  src/
+    api/
+      schema.d.ts                -> tipos generados desde el backend (NO
+                                     editar a mano, se regenera con
+                                     `pnpm gen:api`)
+      client.ts                  -> cliente openapi-fetch + middleware de
+                                     auth/refresh + helper unwrap()
+    stores/
+      auth-store.ts              -> zustand: usuario, accessToken (memoria),
+                                     refreshToken (localStorage)
+    lib/
+      jwt.ts                     -> decodifica exp del JWT
+      query-client.ts            -> instancia de TanStack QueryClient
+      format.ts                  -> formatMonto() y formatDate() (sin
+                                     asumir una moneda: el backend solo
+                                     manda strings decimales), MESES
+      utils.ts                   -> cn() (generado por shadcn)
+    hooks/
+      use-periodo.ts             -> estado compartido {mes, anio} que usan
+                                     todas las páginas con filtro de periodo
+    components/
+      ui/                        -> button, input, label, card, table,
+                                     dialog, select, dropdown-menu, badge,
+                                     sonner, separator, tabs (shadcn/ui)
+      layout/
+        AppShell.tsx              -> sidebar de navegación + logout
+        ProtectedRoute.tsx        -> redirige a /login si no hay sesión
+        PeriodoPicker.tsx         -> selector de mes/año reutilizable
+    features/                    -> un paquete por módulo del backend,
+                                     mismo patrón en los 7:
+                                       api.ts     (hooks de TanStack Query
+                                                   sobre el cliente tipado)
+                                       schemas.ts (validación zod de
+                                                   formularios, cuando aplica)
+                                       *Page.tsx  (la o las pantallas)
+                                       *FormDialog.tsx (formularios en modal)
+      auth/           LoginPage, RegisterPage
+      dashboard/      DashboardPage (balance mensual + alertas pendientes)
+      ingresos/       IngresosPage (ejemplo de referencia: list + create)
+      gastos/         GastosPage (gasto puntual + pago de servicio fijo +
+                                   balance)
+      servicios-fijos/ServiciosFijosPage
+      planes-financieros/PlanesFinancierosPage (crear, activar, comparativa)
+      alertas/        AlertasPage (tabs por estado, generar, cambiar estado)
+      catalogos/      CatalogosPage (categorías + niveles de prioridad)
+    router.tsx                   -> definición de rutas (react-router-dom)
+    App.tsx                      -> QueryClientProvider + RouterProvider +
+                                     Toaster (sonner)
+
+
+5. DETALLE POR MÓDULO (qué cubre cada uno, mapeado a los 23 endpoints)
+-------------------------------------------------------
+- usuarios:    registro, login, refresh -> auth-store + LoginPage/RegisterPage
+- catalogos:   GET/POST categorías, GET niveles de prioridad -> CatalogosPage
+               (también consumido por los selects de Gastos y Servicios Fijos)
+- ingresos:    GET/POST ingresos, GET total-periodo -> IngresosPage
+               (módulo de referencia: es el patrón a copiar para lo que
+               falte, tal como sugiere el README del backend)
+- servicios-fijos: GET/POST, GET próximos-a-vencer -> ServiciosFijosPage
+               (marca con un badge los que están por vencer)
+- gastos:      GET/POST gasto puntual, POST pago de servicio fijo, GET
+               balance-mensual, GET variación-servicios (hook listo,
+               sin pantalla dedicada todavía), GET modo-emergencia (hook
+               listo, sin pantalla todavía) -> GastosPage + DashboardPage
+- planes-financieros: GET/POST, POST activar, GET comparativa ->
+               PlanesFinancierosPage (maneja el 404 "no tenés plan
+               activo" como estado normal de la UI, no como error)
+- alertas:     GET (con filtro de estado), POST generar, PATCH cambiar
+               estado -> AlertasPage (tabs Pendiente/Enviada/Leída/Resuelta)
+
+Pendiente si se quiere completar el 100% de la superficie de la API:
+pantallas dedicadas para variación de precios de un servicio fijo y para
+el simulador de "modo emergencia" (los hooks useVariacionServicio y
+useModoEmergencia en features/gastos/api.ts ya están escritos y tipados,
+solo falta la UI).
+
+
+6. UN PROBLEMA DE DISEÑO DEL BACKEND Y CÓMO SE LO ESQUIVÓ
+-------------------------------------------------------
+El backend reutiliza el mismo serializer de Django para leer y para
+escribir en varios endpoints (CategoriaGasto, Ingreso, ServicioFijo,
+Gasto, PlanFinanciero). Como consecuencia, el OpenAPI generado
+(drf-spectacular) describe el body de un POST con el mismo schema que
+la respuesta, incluyendo campos que en la práctica son de solo lectura
+(id, usuario_id, activo, servicio_fijo_id) como si fueran obligatorios
+en el body de creación.
+
+Esto NO se arregló en el backend (no se tocó una sola línea de
+finanzas_backend/ en toda esta sesión). Se resolvió del lado del
+frontend en cada features/<módulo>/api.ts:
+  - Se define un tipo de input real con
+    `Omit<SchemaCompleto, 'id' | 'usuario_id' | ...>` que refleja lo
+    que el body realmente necesita (así los formularios están bien
+    tipados y no dejan mandar campos de más).
+  - Al momento de llamar a `api.POST(...)`, como el tipo que exige
+    openapi-fetch es el schema completo (por la reutilización de
+    arriba), se hace un cast explícito (`body as SchemaCompleto`) con
+    un comentario que documenta por qué. Es un ajuste acotado al punto
+    exacto donde el schema generado no es preciso, no una excepción
+    generalizada al tipado.
+
+Si en algún momento se separan los serializers de lectura/escritura en
+el backend, este cast deja de hacer falta y se puede borrar sin tocar
+el resto del código (los tipos de Input ya están correctos).
+
+
+7. VERIFICACIÓN REALIZADA (no fue "confío en que compila")
+-------------------------------------------------------
+- `pnpm exec tsc -b`: cero errores de tipos en todo el proyecto.
+- `pnpm lint` (oxlint): cero errores; solo warnings esperables
+  (archivos ui/*.tsx de shadcn que exportan una constante junto al
+  componente, y el uso de `watch()` de react-hook-form, ninguno es un
+  bug).
+- Se levantó el backend real (ya estaba corriendo en Docker,
+  finanzas_backend_api + finanzas_backend_db, puerto 8000) y el
+  frontend con `pnpm dev` (puerto 5173).
+- Se armó un script descartable con Playwright (Chrome real, headless)
+  para probar la app como la usaría una persona, no solo "el código
+  compila":
+    1. Entrar a http://localhost:5173/ sin sesión -> redirige a /login
+       (screenshot ok).
+    2. Registrar un usuario nuevo por el form -> entra al Dashboard,
+       widgets de balance en 0 (screenshot ok).
+    3. Crear un ingreso desde el diálogo "Nuevo ingreso" -> aparece en
+       la tabla y el card "Total del periodo" pasa de 0 a 150.000,00
+       (screenshot ok, toast "Ingreso registrado" visible).
+    4. Navegar por las 7 secciones del sidebar (Gastos, Servicios
+       Fijos, Planes Financieros, Alertas, Catálogos) -> cada una
+       renderiza sin pantallas en blanco ni errores; Catálogos muestra
+       datos reales sembrados en la base (categorías globales, niveles
+       de prioridad Esencial/Importante/Prescindible).
+    5. Recargar la página estando logueado -> la sesión persiste (se
+       confirma que el refresh proactivo del access token funciona).
+    6. Se revisó la consola del navegador en todo el recorrido: cero
+       errores de React, cero requests fallidos o 5xx. El único 404
+       visto es el esperado de /api/planes-financieros/comparativa/
+       cuando el usuario todavía no tiene un plan activo, que la UI
+       muestra como mensaje normal ("No tenés un plan activo para este
+       periodo"), no como error.
+  El script y las capturas eran descartables (viven en el scratchpad
+  de la sesión, no en el repo).
+
+
+8. CÓMO CORRER TODO
+-------------------------------------------------------
+Backend (ya corría en Docker al momento de escribir esto):
+  cd finanzas_backend && docker compose up
+Frontend:
+  cd finanzas_frontend
+  nvm use              (usa el .nvmrc, resuelve a Node 24)
+  pnpm install
+  pnpm dev             -> http://localhost:5173
+
+
+9. LO QUE QUEDA AFUERA A PROPÓSITO (no se hizo, y por qué)
+-------------------------------------------------------
+- No se inicializó git en proyecto_finanzas/ ni en finanzas_frontend/:
+  ninguna de las carpetas del proyecto tenía repo, no se asumió que
+  correspondía crear uno sin que el usuario lo pida.
+- No se tocó nada dentro de finanzas_backend/ (ni CORS, ni el
+  serializer duplicado de la sección 6): el pedido era armar el
+  frontend, y el proxy de Vite ya resuelve el problema de CORS en
+  desarrollo sin depender de un cambio en el backend.
+- No se agregó edición ni borrado de registros (solo alta y lectura,
+  que es lo que expone la API actual — no hay PUT/DELETE documentados
+  para ingresos, gastos, servicios fijos ni planes).
+- No se armó un selector de tema claro/oscuro, aunque shadcn instaló
+  `next-themes` como dependencia de su propio preset y el CSS ya trae
+  las variables para modo oscuro definidas: no se pidió y agregarlo
+  hoy hubiera sido una funcionalidad no solicitada.
+- No hay tests automatizados (unitarios ni e2e) incorporados al
+  repo: la verificación de la sección 7 fue manual/descartable para
+  confirmar que esta primera versión funciona, no un suite permanente.

@@ -1,0 +1,280 @@
+================================================================================
+GUÍA DE SOLUCIÓN — MÓDULO ingresos
+================================================================================
+Entidad INGRESOS / tabla `ingresos`. Ingresos variables mes a mes,
+agrupados por periodo (mes/anio). Es el módulo "de práctica": poca regla,
+patrón puro. Su suma por periodo es la mitad de vista_balance_mensual.
+
+
+--------------------------------------------------------------------------------
+1. domain/entities.py  ->  Ingreso
+--------------------------------------------------------------------------------
+### TODO pertenece_al_periodo(mes, anio)
+    def pertenece_al_periodo(self, mes: int, anio: int) -> bool:
+        return self.periodo_mes == mes and self.periodo_anio == anio
+
+### TODO es_monto_valido()
+    def es_monto_valido(self) -> bool:
+        return self.monto > 0
+
+POR QUÉ:
+- Ambos son lecturas de atributos propios -> van en la entidad.
+- es_monto_valido() replica el CHECK (monto > 0) del schema como
+  invariante consultable. Decisión de diseño: NO validamos en
+  __post_init__ lanzando ValueError. Motivo: el kata mantiene las
+  entidades como estructuras de datos "tontas" (igual que catalogos), así
+  podés construir un Ingreso "a medio llenar" en un test sin que explote.
+  La validación que corta el flujo vive en el caso de uso (punto 3).
+- monto es Decimal; `self.monto > 0` compara Decimal con int sin problema.
+- Alternativa (opcional): usar shared/domain/value_objects.py::Periodo en
+  vez de dos ints. Si lo hacés, cambiá el campo y todos los usos. Hoy se
+  deja con ints planos para espejar la tabla.
+
+
+--------------------------------------------------------------------------------
+2. domain/ports/repositories.py
+--------------------------------------------------------------------------------
+Interfaz ABC ya completa. Contrato clave:
+- sumar_montos_por_periodo devuelve Decimal, 0 si no hay filas (es el
+  COALESCE(SUM(monto), 0) de vista_balance_mensual).
+
+
+--------------------------------------------------------------------------------
+3. application/use_cases/registrar_ingreso.py
+--------------------------------------------------------------------------------
+    def ejecutar(self, usuario_id, monto, fecha, periodo_mes, periodo_anio,
+                 fuente=None, descripcion=None):
+        if monto is None or monto <= 0:
+            raise MontoInvalido("El monto debe ser mayor a 0")
+        if not (1 <= periodo_mes <= 12):
+            raise PeriodoInvalido("periodo_mes debe estar entre 1 y 12")
+        if periodo_anio < 2000:
+            raise PeriodoInvalido("periodo_anio no es razonable")
+        ingreso = Ingreso(
+            usuario_id=usuario_id, monto=monto, fecha=fecha,
+            periodo_mes=periodo_mes, periodo_anio=periodo_anio,
+            fuente=(fuente or None), descripcion=(descripcion or None),
+        )
+        return self.repositorio.crear(ingreso)
+
+POR QUÉ:
+- Un solo punto de control de las 3 reglas (monto, mes, anio). El CHECK de
+  la base es la última barrera; acá das el error de negocio legible.
+- `fuente or None` normaliza "" -> None para no ensuciar la columna.
+- La entidad nace sin id; el repo devuelve la copia con id.
+
+
+--------------------------------------------------------------------------------
+4. application/use_cases/listar_ingresos_del_periodo.py
+--------------------------------------------------------------------------------
+    def ejecutar(self, usuario_id, periodo_mes, periodo_anio):
+        return self.repositorio.listar_por_usuario_y_periodo(
+            usuario_id, periodo_mes, periodo_anio
+        )
+
+POR QUÉ: el puerto ya promete el orden por fecha. El caso de uso orquesta,
+no decide (igual que ListarCategoriasUseCase en catalogos).
+
+
+--------------------------------------------------------------------------------
+5. application/use_cases/calcular_total_ingresos_periodo.py
+--------------------------------------------------------------------------------
+    def ejecutar(self, usuario_id, periodo_mes, periodo_anio):
+        return self.repositorio.sumar_montos_por_periodo(
+            usuario_id, periodo_mes, periodo_anio
+        )
+
+POR QUÉ: es la mitad "ingresos" de vista_balance_mensual. Este resultado
+lo consume CalcularBalanceMensualUseCase en el módulo gastos (que resta el
+total de gastos). Por eso vive separado y devuelve un Decimal crudo.
+
+
+--------------------------------------------------------------------------------
+6. infrastructure/repositories.py  ->  DjangoIngresoRepository
+--------------------------------------------------------------------------------
+    from decimal import Decimal
+    from typing import Optional
+    from django.db.models import Sum
+
+    from modules.ingresos.domain.entities import Ingreso
+    from modules.ingresos.domain.ports.repositories import IngresoRepository
+    from modules.ingresos.infrastructure.models import IngresoModel
+
+
+    class DjangoIngresoRepository(IngresoRepository):
+        def _a_entidad(self, m: IngresoModel) -> Ingreso:
+            return Ingreso(
+                id=m.id, usuario_id=m.usuario_id, monto=m.monto, fecha=m.fecha,
+                periodo_mes=m.periodo_mes, periodo_anio=m.periodo_anio,
+                fuente=m.fuente, descripcion=m.descripcion,
+                fecha_registro=m.fecha_registro,
+            )
+
+        def obtener_por_id(self, ingreso_id):
+            try:
+                return self._a_entidad(IngresoModel.objects.get(id=ingreso_id))
+            except IngresoModel.DoesNotExist:
+                return None
+
+        def crear(self, ingreso):
+            m = IngresoModel.objects.create(
+                usuario_id=ingreso.usuario_id, monto=ingreso.monto,
+                fecha=ingreso.fecha, periodo_mes=ingreso.periodo_mes,
+                periodo_anio=ingreso.periodo_anio, fuente=ingreso.fuente,
+                descripcion=ingreso.descripcion,
+            )
+            return self._a_entidad(m)
+
+        def listar_por_usuario_y_periodo(self, usuario_id, periodo_mes, periodo_anio):
+            qs = IngresoModel.objects.filter(
+                usuario_id=usuario_id, periodo_mes=periodo_mes,
+                periodo_anio=periodo_anio,
+            ).order_by("fecha")
+            return [self._a_entidad(m) for m in qs]
+
+        def sumar_montos_por_periodo(self, usuario_id, periodo_mes, periodo_anio):
+            total = IngresoModel.objects.filter(
+                usuario_id=usuario_id, periodo_mes=periodo_mes,
+                periodo_anio=periodo_anio,
+            ).aggregate(total=Sum("monto"))["total"]
+            return total or Decimal("0")
+
+POR QUÉ:
+- usuario_id= (no usuario=) para filtrar por la columna sin traer el User.
+- aggregate(Sum("monto")) devuelve None cuando no hay filas -> `or
+  Decimal("0")` reproduce COALESCE(..., 0). No devuelvas 0 int: mantené
+  Decimal para no mezclar tipos aguas abajo.
+- El filtro (usuario_id, periodo_anio, periodo_mes) usa el índice
+  idx_ingresos_usuario_periodo del schema.
+
+
+--------------------------------------------------------------------------------
+7. infrastructure/models.py
+--------------------------------------------------------------------------------
+Ya está mapeado 1:1 y managed=False. El TODO es opcional (reflejar los
+CHECK como Meta.constraints). No hace falta para funcionar: la validación
+de negocio la hace el caso de uso y el CHECK real está en el SQL.
+
+
+--------------------------------------------------------------------------------
+8. interfaces/api/  (views, urls, serializers)
+--------------------------------------------------------------------------------
+Helper para leer ?mes=&anio= (úsalo también en gastos/planes/alertas):
+
+    from rest_framework.exceptions import ValidationError
+
+    def leer_periodo(request):
+        try:
+            return int(request.query_params["mes"]), int(request.query_params["anio"])
+        except (KeyError, ValueError):
+            raise ValidationError("Parametros 'mes' y 'anio' requeridos (enteros).")
+
+views.py:
+
+    class IngresosView(APIView):
+        def get(self, request):
+            mes, anio = leer_periodo(request)
+            caso = ListarIngresosDelPeriodoUseCase(repositorio=DjangoIngresoRepository())
+            datos = caso.ejecutar(request.user.id, mes, anio)
+            return Response(IngresoSerializer(datos, many=True).data)
+
+        def post(self, request):
+            entrada = IngresoSerializer(data=request.data)
+            entrada.is_valid(raise_exception=True)
+            caso = RegistrarIngresoUseCase(repositorio=DjangoIngresoRepository())
+            try:
+                ingreso = caso.ejecutar(
+                    usuario_id=request.user.id,
+                    monto=entrada.validated_data["monto"],
+                    fecha=entrada.validated_data["fecha"],
+                    periodo_mes=entrada.validated_data["periodo_mes"],
+                    periodo_anio=entrada.validated_data["periodo_anio"],
+                    fuente=entrada.validated_data.get("fuente"),
+                    descripcion=entrada.validated_data.get("descripcion"),
+                )
+            except (MontoInvalido, PeriodoInvalido) as e:
+                return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(IngresoSerializer(ingreso).data, status=status.HTTP_201_CREATED)
+
+
+    class TotalIngresosPeriodoView(APIView):
+        def get(self, request):
+            mes, anio = leer_periodo(request)
+            caso = CalcularTotalIngresosPeriodoUseCase(repositorio=DjangoIngresoRepository())
+            total = caso.ejecutar(request.user.id, mes, anio)
+            return Response(TotalIngresosPeriodoSerializer(
+                {"periodo_mes": mes, "periodo_anio": anio, "total_ingresos": total}
+            ).data)
+
+POR QUÉ:
+- request.user.id = id de auth_user (ver CONFIGURACION_FUNCIONAL.txt sec. 5).
+- El serializer valida forma; el caso de uso, negocio; la excepción de
+  dominio -> 400.
+
+
+--------------------------------------------------------------------------------
+9. tests
+--------------------------------------------------------------------------------
+Doble en memoria (tests/application/test_use_cases.py):
+
+    from decimal import Decimal
+    from dataclasses import replace
+
+    def obtener_por_id(self, ingreso_id):
+        return next((i for i in self._ingresos if i.id == ingreso_id), None)
+
+    def crear(self, ingreso):
+        creado = replace(ingreso, id=self._siguiente_id)
+        self._ingresos.append(creado)
+        self._siguiente_id += 1
+        return creado
+
+    def listar_por_usuario_y_periodo(self, usuario_id, periodo_mes, periodo_anio):
+        return [
+            i for i in self._ingresos
+            if i.usuario_id == usuario_id
+            and i.pertenece_al_periodo(periodo_mes, periodo_anio)
+        ]
+
+    def sumar_montos_por_periodo(self, usuario_id, periodo_mes, periodo_anio):
+        return sum(
+            (i.monto for i in self.listar_por_usuario_y_periodo(
+                usuario_id, periodo_mes, periodo_anio)),
+            Decimal("0"),
+        )
+
+Ejemplos:
+
+    def test_monto_no_positivo_lanza_MontoInvalido(self):
+        caso = RegistrarIngresoUseCase(repositorio=RepositorioIngresoFalso())
+        with self.assertRaises(MontoInvalido):
+            caso.ejecutar(usuario_id=1, monto=Decimal("0"), fecha=date(2026, 3, 1),
+                          periodo_mes=3, periodo_anio=2026)
+
+    def test_suma_solo_los_ingresos_del_periodo_pedido(self):
+        repo = RepositorioIngresoFalso([
+            Ingreso(id=1, usuario_id=1, monto=Decimal("800000"), periodo_mes=1, periodo_anio=2026),
+            Ingreso(id=2, usuario_id=1, monto=Decimal("120000"), periodo_mes=3, periodo_anio=2026),
+            Ingreso(id=3, usuario_id=1, monto=Decimal("900000"), periodo_mes=3, periodo_anio=2026),
+        ])
+        caso = CalcularTotalIngresosPeriodoUseCase(repositorio=repo)
+        self.assertEqual(caso.ejecutar(1, 3, 2026), Decimal("1020000"))
+
+    def test_devuelve_cero_si_no_hay_ingresos(self):
+        caso = CalcularTotalIngresosPeriodoUseCase(repositorio=RepositorioIngresoFalso())
+        self.assertEqual(caso.ejecutar(1, 7, 2026), Decimal("0"))
+
+(Los montos y periodos salen de 02_seed_test_data.sql: enero 800000,
+marzo 900000 + freelance 120000 = 1.020.000.)
+
+
+--------------------------------------------------------------------------------
+10. VERIFICACIÓN MANUAL
+--------------------------------------------------------------------------------
+    uv run python -m unittest modules.ingresos.tests.domain.test_entities \
+        modules.ingresos.tests.application.test_use_cases -v
+
+    # server + logueado:
+    GET /api/ingresos/?mes=3&anio=2026
+    GET /api/ingresos/total-periodo/?mes=3&anio=2026   -> total_ingresos: "1020000.00"
+================================================================================

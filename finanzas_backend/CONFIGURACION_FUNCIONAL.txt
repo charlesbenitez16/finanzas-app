@@ -1,0 +1,295 @@
+================================================================================
+CONFIGURACIÓN PARA DEJAR LA APP FUNCIONAL
+================================================================================
+
+Este archivo cubre TODO lo que hay que tocar fuera de la lógica de cada
+módulo para que el backend arranque, sirva la API y corra los tests.
+Los TODO de negocio de cada módulo están en modules/<modulo>/SOLUCION.txt.
+
+Orden recomendado de lectura:
+  1. Esta guía (infraestructura + settings + shared/).
+  2. modules/usuarios/SOLUCION.txt      (el más simple con reglas)
+  3. modules/ingresos/SOLUCION.txt
+  4. modules/servicios_fijos/SOLUCION.txt
+  5. modules/gastos/SOLUCION.txt        (el más grande: balance, variación, emergencia)
+  6. modules/planes_financieros/SOLUCION.txt
+  7. modules/alertas/SOLUCION.txt       (evento GastoRegistrado)
+
+
+--------------------------------------------------------------------------------
+1. REQUISITOS
+--------------------------------------------------------------------------------
+- Python 3.12+
+- uv (https://docs.astral.sh/uv/)
+- Docker + docker compose (para PostgreSQL)
+
+    uv sync            # crea .venv/ con Django 6.1, DRF, psycopg
+
+
+--------------------------------------------------------------------------------
+2. BASE DE DATOS: LEVANTAR POSTGRES Y CARGAR EL SCHEMA
+--------------------------------------------------------------------------------
+POR QUÉ es obligatorio cargar el .sql a mano: TODOS los modelos Django de
+estos módulos son `managed = False`. Eso significa que `manage.py migrate`
+NUNCA crea las tablas de dominio (usuarios, ingresos, servicios_fijos,
+gastos, plan_financiero, alertas_pago) ni las vistas. La fuente de verdad
+de esas tablas es finanzas_db/schema_finanzas.sql.
+
+    cd finanzas_db
+    docker compose up -d
+    # esperar unos segundos a que Postgres levante
+
+    # cargar schema + datos de prueba
+    docker compose exec -T db psql -U finanzas_user -d finanzas_db < schema_finanzas.sql
+    docker compose exec -T db psql -U finanzas_user -d finanzas_db < 02_seed_test_data.sql
+
+(si tenés `psql` en el host y el contenedor publica el 5432:
+    psql "postgresql://finanzas_user:finanzas_pass@localhost:5432/finanzas_db" -f schema_finanzas.sql
+)
+
+Credenciales por defecto (ya están en config/settings/base.py):
+    POSTGRES_DB=finanzas_db  USER=finanzas_user  PASSWORD=finanzas_pass
+    HOST=localhost  PORT=5432
+Si tu contenedor usa otro puerto, exportá esas variables antes de correr manage.py.
+
+
+--------------------------------------------------------------------------------
+3. MIGRACIONES DE DJANGO
+--------------------------------------------------------------------------------
+    uv run manage.py migrate
+
+Esto crea SOLO las tablas propias de Django (auth_user, django_session,
+django_admin_log, django_content_type, ...). No toca ninguna tabla de
+dominio porque son managed=False.
+
+Las migraciones 0001_initial.py de cada módulo son STUBS (operations = []).
+Cuando termines de definir los campos de un `infrastructure/models.py`,
+regenerá su migración:
+
+    uv run manage.py makemigrations usuarios ingresos servicios_fijos gastos \
+                                    planes_financieros alertas
+
+makemigrations va a generar un `CreateModel(..., options={'managed': False})`
+por modelo. En `migrate` eso NO ejecuta DDL (no crea nada): solo deja el
+estado registrado para que `manage.py check` y el sistema de migraciones
+queden consistentes. Es exactamente lo que hizo catalogos en su
+0001_initial.py.
+
+Dependencias entre apps: makemigrations las detecta solo. Si mantenés las
+ForeignKey por string ("catalogos.CategoriaGastoModel", etc.) vas a ver
+que la migración de `gastos` depende de `catalogos` y `servicios_fijos`,
+y la de `alertas` depende de `servicios_fijos` y `gastos`. Todo automático.
+
+    uv run manage.py check      # debe pasar sin errores
+
+
+--------------------------------------------------------------------------------
+4. SETTINGS: REST FRAMEWORK (config/settings/base.py)
+--------------------------------------------------------------------------------
+Hoy `REST_FRAMEWORK = {}` con un TODO. Las vistas usan `request.user.id`,
+así que hace falta autenticación. Reemplazá el dict vacío por:
+
+    REST_FRAMEWORK = {
+        "DEFAULT_AUTHENTICATION_CLASSES": [
+            "rest_framework.authentication.SessionAuthentication",
+            "rest_framework.authentication.BasicAuthentication",
+        ],
+        "DEFAULT_PERMISSION_CLASSES": [
+            "rest_framework.permissions.IsAuthenticated",
+        ],
+    }
+
+POR QUÉ:
+- SessionAuthentication: te deja usar la API navegable de DRF reutilizando
+  la sesión del login de /admin/ (mismo truco que ya documenta catalogos).
+- BasicAuthentication: cómodo para probar con curl/Postman sin token.
+- IsAuthenticated por defecto: toda la API pide usuario logueado.
+- Cuando construyas auth por token/JWT, cambiás solo este bloque.
+
+ENDPOINTS PÚBLICOS: las vistas que NO deben pedir login tienen que
+sobrescribir el permiso. Como mínimo:
+
+    # modules/usuarios/interfaces/api/views.py
+    class RegistroView(APIView):
+        authentication_classes = []
+        permission_classes = [AllowAny]      # si no, no podés registrarte
+    class LoginView(APIView):
+        authentication_classes = []
+        permission_classes = [AllowAny]
+
+    # modules/catalogos/interfaces/api/views.py  (ya existe)
+    class NivelesPrioridadView(APIView):
+        permission_classes = [AllowAny]       # catálogo de solo lectura
+
+(import: `from rest_framework.permissions import AllowAny`)
+
+
+--------------------------------------------------------------------------------
+5. EL CRUCE usuarios <-> AUTH_USER_MODEL  (decisión de arquitectura)
+--------------------------------------------------------------------------------
+Estado actual (heredado de catalogos): todas las FK `usuario` de los
+módulos apuntan a settings.AUTH_USER_MODEL = auth.User (tabla auth_user).
+Pero el schema SQL tiene una tabla `usuarios` hecha a mano (con
+password_hash, etc.) y el módulo `usuarios` la modela con UsuarioModel.
+Son DOS TABLAS DISTINTAS.
+
+PARA DEJAR LA APP FUNCIONAL YA (recomendado para el kata):
+  - No hagas nada especial. Seguí usando auth.User.
+  - `createsuperuser`, login en /admin/, y `request.user.id` es el id de
+    auth_user. Las columnas `usuario_id` del dominio referencian ese id.
+  - UsuarioModel + la tabla `usuarios` quedan como una estructura
+    paralela: el módulo `usuarios` funciona (registrar/login/desactivar
+    sobre esa tabla) pero NO es el usuario de sesión de Django.
+
+PARA UNIFICAR (cambio grande, hacelo aparte, NO como parte del kata):
+  1. Convertir UsuarioModel en un AbstractBaseUser:
+       - heredar de AbstractBaseUser (+ PermissionsMixin si querés admin)
+       - USERNAME_FIELD = "email"
+       - agregar is_active/is_staff/last_login, un UserManager, y usar
+         `password` (el campo estándar de Django) en vez de password_hash,
+         o mapear password_hash -> get/set con db_column.
+  2. AUTH_USER_MODEL = "usuarios.UsuarioModel" en base.py (ANTES del
+     primer migrate del proyecto, o hay que resetear migraciones).
+  3. Revisar cada `ForeignKey(settings.AUTH_USER_MODEL, ...)` de los otros
+     módulos: al apuntar todos a la misma constante, migran solos, pero
+     hay que regenerar migraciones.
+  4. managed=False sigue valiendo: la tabla `usuarios` ya existe en el SQL.
+Documentá cuál camino tomaste.
+
+
+--------------------------------------------------------------------------------
+6. shared/  — LOS TODO DEL KERNEL COMPARTIDO
+--------------------------------------------------------------------------------
+Estos NO son de un módulo pero varios módulos dependen de ellos.
+
+6.1 shared/domain/base_entity.py
+    `Entity.es_nueva()` YA está resuelto (`return self.id is None`).
+    No hay nada que hacer. Toda entidad hereda de acá.
+
+6.2 shared/domain/events.py  -> EventBus (lo usa gastos para publicar y
+    alertas para suscribirse)
+
+    def suscribir(self, tipo_evento, manejador):
+        self._suscriptores.setdefault(tipo_evento, []).append(manejador)
+
+    def publicar(self, evento):
+        for manejador in self._suscriptores.get(type(evento), []):
+            manejador(evento)
+
+    POR QUÉ así:
+    - Bus síncrono en memoria: alcanza para un monolito modular (un solo
+      proceso, una sola transacción). `gastos` publica GastoRegistrado y,
+      en la misma llamada, corre el handler de `alertas`.
+    - `type(evento)` = match exacto de clase, sin recorrer herencia:
+      predecible y suficiente.
+    - Si algún día querés async/durabilidad (Celery, outbox), cambiás solo
+      esta implementación; la interfaz `suscribir/publicar` no se toca.
+    - GOTCHA para tests: `event_bus` es un singleton de módulo. En
+      setUp de un test hacé `event_bus._suscriptores.clear()` o suscribí
+      un espía local y verificá que lo llamaron.
+
+6.3 shared/domain/value_objects.py  -> Periodo y Dinero  (OPCIONALES)
+
+    Los módulos hoy usan ints planos (periodo_mes/periodo_anio) y Decimal,
+    igual que las tablas. Adoptar estos value objects es una mejora de
+    tipado, no un requisito. Si los implementás:
+
+    @dataclass(frozen=True)
+    class Periodo:
+        mes: int
+        anio: int
+        def __post_init__(self):
+            if not (1 <= self.mes <= 12):
+                raise ValueError(f"mes fuera de rango: {self.mes}")
+            if self.anio < 2000:
+                raise ValueError(f"anio no razonable: {self.anio}")
+        def __str__(self):
+            return f"{self.anio:04d}-{self.mes:02d}"
+
+    @dataclass(frozen=True)
+    class Dinero:
+        monto: Decimal
+        def __post_init__(self):
+            if self.monto < 0:
+                raise ValueError("Dinero no puede ser negativo")
+        def porcentaje_de_variacion_respecto_a(self, monto_anterior: "Dinero") -> Decimal:
+            if monto_anterior.monto == 0:
+                raise ValueError("variacion respecto a 0 indefinida")
+            return (self.monto - monto_anterior.monto) / monto_anterior.monto * Decimal("100")
+
+    POR QUÉ frozen: un value object es inmutable y se compara por valor.
+    __post_init__ en frozen dataclass sirve para validar (no podés
+    reasignar, pero sí lanzar). `Dinero` prohíbe negativos: encaja para
+    montos, NO lo uses para "balance" (que puede ser negativo).
+
+
+--------------------------------------------------------------------------------
+7. CREAR USUARIO ADMIN Y LEVANTAR EL SERVIDOR
+--------------------------------------------------------------------------------
+    uv run manage.py createsuperuser
+    uv run manage.py runserver
+
+    Admin:               http://localhost:8000/admin/
+    Catálogos:           http://localhost:8000/api/catalogos/niveles-prioridad/
+                         http://localhost:8000/api/catalogos/categorias/
+    Usuarios:            POST http://localhost:8000/api/usuarios/registro/
+                         POST http://localhost:8000/api/usuarios/login/
+    Ingresos:            http://localhost:8000/api/ingresos/
+                         http://localhost:8000/api/ingresos/total-periodo/?mes=3&anio=2026
+    Servicios fijos:     http://localhost:8000/api/servicios-fijos/
+                         http://localhost:8000/api/servicios-fijos/proximos-a-vencer/
+    Gastos:              http://localhost:8000/api/gastos/?mes=3&anio=2026
+                         POST http://localhost:8000/api/gastos/pagos-servicio/
+                         http://localhost:8000/api/gastos/balance-mensual/?mes=3&anio=2026
+                         http://localhost:8000/api/gastos/variacion-servicios/?servicio_fijo_id=2
+                         http://localhost:8000/api/gastos/modo-emergencia/?mes=3&anio=2026
+    Planes:              http://localhost:8000/api/planes-financieros/
+                         POST http://localhost:8000/api/planes-financieros/<id>/activar/
+                         http://localhost:8000/api/planes-financieros/comparativa/?mes=3&anio=2026
+    Alertas:             http://localhost:8000/api/alertas/?estado=Pendiente
+                         POST http://localhost:8000/api/alertas/generar/
+                         PATCH http://localhost:8000/api/alertas/<id>/
+
+Para probar endpoints con IsAuthenticated: logueate en /admin/ y navegá
+la API en el mismo browser (DRF reutiliza la sesión).
+
+
+--------------------------------------------------------------------------------
+8. TESTS
+--------------------------------------------------------------------------------
+DOMINIO + APLICACIÓN (Python puro, sin base de datos, sin Django settings):
+
+    uv run python -m unittest discover -s modules -p "test_*.py" -v
+
+    Ojo: los tests de application/ NO deben importar nada de Django.
+    Por eso los casos de uso que necesitan hash de contraseña reciben el
+    hasher POR INYECCIÓN (ver modules/usuarios/SOLUCION.txt): así el test
+    pasa un lambda y no arrastra django.contrib.auth.hashers.
+
+INFRAESTRUCTURA (necesita Postgres real):
+
+    uv run manage.py test
+
+    Cada TestCase de tests/infrastructure/ crea su tabla managed=False con
+    SQL crudo en setUpClass (IF NOT EXISTS), porque Django no las crea en
+    la base de test. Ese DDL es un subconjunto mínimo del real; la fuente
+    de verdad sigue siendo schema_finanzas.sql.
+
+
+--------------------------------------------------------------------------------
+9. CHECKLIST FINAL "LA APP ARRANCA Y RESPONDE"
+--------------------------------------------------------------------------------
+[ ] docker compose up -d  + schema_finanzas.sql + 02_seed_test_data.sql cargados
+[ ] uv sync
+[ ] REST_FRAMEWORK configurado en base.py (sección 4)
+[ ] RegistroView / LoginView / NivelesPrioridadView con AllowAny (sección 4)
+[ ] uv run manage.py migrate            -> OK (solo tablas Django)
+[ ] infrastructure/models.py de cada módulo completado
+[ ] uv run manage.py makemigrations <apps>   -> genera CreateModel managed=False
+[ ] uv run manage.py migrate            -> OK (sin DDL de dominio)
+[ ] uv run manage.py check              -> System check identified no issues
+[ ] uv run manage.py createsuperuser
+[ ] uv run manage.py runserver          -> GET /api/catalogos/niveles-prioridad/ responde 200
+[ ] shared/domain/events.py EventBus implementado (para que alertas reaccione a pagos)
+[ ] modules/alertas/apps.py::ready() suscribe el handler (ver alertas/SOLUCION.txt)
+================================================================================
