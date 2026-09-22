@@ -7,7 +7,20 @@ from .base import *  # noqa: F401,F403
 DEBUG = False
 ALLOWED_HOSTS = os.environ.get("DJANGO_ALLOWED_HOSTS", "").split(",")
 
-# TODO antes de desplegar a produccion:
-# - SECRET_KEY debe venir de una variable de entorno segura (no el valor por defecto de base.py)
-# - Configurar HTTPS: SECURE_SSL_REDIRECT, SESSION_COOKIE_SECURE, CSRF_COOKIE_SECURE
-# - Configurar STATIC_ROOT y correr collectstatic
+STATIC_ROOT = BASE_DIR / "staticfiles"
+
+STORAGES = {
+        "default": {
+            "BACKEND": "django.core.files.storage.FileSystemStorage",
+        },
+        "staticfiles": {
+            "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+        },
+    }
+
+CORS_ALLOWED_ORIGINS = [
+        origin for origin in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if origin
+    ]
+CSRF_TRUSTED_ORIGINS = [
+        origin for origin in os.environ.get("CSRF_TRUSTED_ORIGINS", "").split(",") if origin
+    ]
